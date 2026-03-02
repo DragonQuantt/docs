@@ -8,16 +8,16 @@
 
 ## 目录
 
-- [一、系统设计 — 解耦与高可用](#一系统设计--解耦与高可用)
-- [二、目录结构与服务职责](#二目录结构与服务职责)
-- [三、AWS 部署方案](#三aws-部署方案)
-- [四、通信总线选型: Redis vs Kafka](#四通信总线选型-redis-vs-kafka)
-- [附录 A: 策略兼容性矩阵](#附录-a-策略兼容性矩阵)
-- [附录 B: Terraform 模块清单](#附录-b-terraform-模块清单)
+- [一、系统设计 — 解耦与高可用](#system-design)
+- [二、目录结构与服务职责](#directory-structure)
+- [三、AWS 部署方案](#aws-deployment)
+- [四、通信总线选型: Redis vs Kafka](#message-bus)
+- [附录 A: 策略兼容性矩阵](#appendix-a)
+- [附录 B: Terraform 模块清单](#appendix-b)
 
 ---
 
-## 一、系统设计 — 解耦与高可用
+## 一、系统设计 — 解耦与高可用 {#system-design}
 
 ### 1.1 设计原则
 
@@ -265,7 +265,7 @@ asset_pool_updated                   (AssetPoolService 发布)
 
 ---
 
-## 二、目录结构与服务职责
+## 二、目录结构与服务职责 {#directory-structure}
 
 ### 2.1 目标目录树
 
@@ -738,7 +738,7 @@ for date in all_trading_dates:
 
 ---
 
-## 三、AWS 部署方案
+## 三、AWS 部署方案 {#aws-deployment}
 
 ### 3.1 是否使用 Terraform?
 
@@ -976,7 +976,7 @@ module "ecs" {
 
 ---
 
-## 四、通信总线选型: Redis vs Kafka
+## 四、通信总线选型: Redis vs Kafka {#message-bus}
 
 ### 4.1 系统内的通信类型分析
 
@@ -1097,7 +1097,7 @@ async def consume_trades(self, symbol: str):
 
 ---
 
-## 附录 A: 策略兼容性矩阵
+## 附录 A: 策略兼容性矩阵 {#appendix-a}
 
 本架构同时兼容 strategy_1 (Top 10 多因子) 和 strategy_2 (baseline_rev):
 
@@ -1121,7 +1121,7 @@ async def consume_trades(self, symbol: str):
 | **V1** (当前架构 + 扩展) | strategy_2 (baseline_rev) | AssetPool + Aggregator + Feature (扩展) + Strategy + Risk + Order |
 | **V2** (完整数据管线) | strategy_1 + strategy_2 全部 | 上述 + DataIngestion + DollarBar + TickFeature |
 
-## 附录 B: Terraform 模块清单
+## 附录 B: Terraform 模块清单 {#appendix-b}
 
 | 模块 | 资源 | 关键参数 |
 |------|------|---------|

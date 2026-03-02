@@ -105,6 +105,13 @@ nav:
   - 配置说明: getting-started/configuration.md
 - 架构设计:
   - architecture/index.md
+  - 架构说明: architecture.md
+- 概述:
+  - 系统概述: overview/00_overview.md
+  - 系统设计 V1/V2: overview/01_system_design_v1_v2.md
+- 前端:
+  - 前端概述: frontend/00_overview.md
+  - API 设计: frontend/01_api_design.md
 - API 参考:
   - api/index.md
   - CLI 命令: api/cli.md
@@ -116,3 +123,6 @@ nav:
   - development/index.md
 - 部署运维:
   - deployment/index.md
+- 迭代计划:
+  - 前端迭代: sprint/front_end_sprint.md
+  - 量化冲刺计划: sprint/industrial_quant_sprint_plan_2026-03-02.md

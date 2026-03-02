@@ -8,22 +8,22 @@
 
 ## 目录
 
-- [一、通用约定](#一通用约定)
-- [二、REST API](#二rest-api)
-  - [2.1 Health (系统状态)](#21-health-系统状态)
-  - [2.2 Account (账户)](#22-account-账户)
-  - [2.3 Strategy (策略)](#23-strategy-策略)
-  - [2.4 Risk (风控)](#24-risk-风控)
-  - [2.5 Portfolio (组合收益)](#25-portfolio-组合收益)
-  - [2.6 Orders (订单)](#26-orders-订单)
-  - [2.7 Signals (信号)](#27-signals-信号)
-  - [2.8 Backtest (回测)](#28-backtest-回测)
-- [三、WebSocket API](#三websocket-api)
-- [四、接口与后端服务映射表](#四接口与后端服务映射表)
+- [一、通用约定](#general-conventions)
+- [二、REST API](#rest-api)
+  - [2.1 Health (系统状态)](#health-api)
+  - [2.2 Account (账户)](#account-api)
+  - [2.3 Strategy (策略)](#strategy-api)
+  - [2.4 Risk (风控)](#risk-api)
+  - [2.5 Portfolio (组合收益)](#portfolio-api)
+  - [2.6 Orders (订单)](#orders-api)
+  - [2.7 Signals (信号)](#signals-api)
+  - [2.8 Backtest (回测)](#backtest-api)
+- [三、WebSocket API](#websocket-api)
+- [四、接口与后端服务映射表](#service-mapping)
 
 ---
 
-## 一、通用约定
+## 一、通用约定 {#general-conventions}
 
 ### Base URL
 
@@ -95,9 +95,9 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 
 ---
 
-## 二、REST API
+## 二、REST API {#rest-api}
 
-### 2.1 Health (系统状态)
+### 2.1 Health (系统状态) {#health-api}
 
 #### GET /api/v1/health
 
@@ -220,7 +220,7 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 
 ---
 
-### 2.2 Account (账户)
+### 2.2 Account (账户) {#account-api}
 
 #### GET /api/v1/account/balance
 
@@ -307,7 +307,7 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 
 ---
 
-### 2.3 Strategy (策略)
+### 2.3 Strategy (策略) {#strategy-api}
 
 #### GET /api/v1/strategy/list
 
@@ -483,7 +483,7 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 
 ---
 
-### 2.4 Risk (风控)
+### 2.4 Risk (风控) {#risk-api}
 
 #### GET /api/v1/risk/status
 
@@ -613,7 +613,7 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 
 ---
 
-### 2.5 Portfolio (组合收益)
+### 2.5 Portfolio (组合收益) {#portfolio-api}
 
 #### GET /api/v1/portfolio/nav
 
@@ -822,7 +822,7 @@ NAV 净值曲线。
 
 ---
 
-### 2.6 Orders (订单)
+### 2.6 Orders (订单) {#orders-api}
 
 #### GET /api/v1/orders/history
 
@@ -936,7 +936,7 @@ NAV 净值曲线。
 
 ---
 
-### 2.7 Signals (信号)
+### 2.7 Signals (信号) {#signals-api}
 
 #### GET /api/v1/signals/latest
 
@@ -1064,7 +1064,7 @@ NAV 净值曲线。
 
 ---
 
-### 2.8 Backtest (回测)
+### 2.8 Backtest (回测) {#backtest-api}
 
 #### POST /api/v1/backtest/run
 
@@ -1164,7 +1164,7 @@ NAV 净值曲线。
 
 ---
 
-## 三、WebSocket API
+## 三、WebSocket API {#websocket-api}
 
 ### 3.1 通用协议
 
@@ -1310,7 +1310,7 @@ NAV 净值曲线。
 
 ---
 
-## 四、接口与后端服务映射表
+## 四、接口与后端服务映射表 {#service-mapping}
 
 | 接口组 | 后端服务 | Redis 键 / DB 表 | 后端路由文件 |
 |--------|---------|------------------|-------------|
