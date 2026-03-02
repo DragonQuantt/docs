@@ -5,9 +5,9 @@ site_url: https://DragonQuantt.github.io/docs
 
 repo_name: DragonQuantt/docs
 repo_url: https://github.com/DragonQuantt/docs
-edit_uri: edit/main/
+edit_uri: edit/main/content/
 
-docs_dir: .
+docs_dir: content
 site_dir: site
 
 theme:
