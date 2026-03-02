@@ -1,0 +1,118 @@
+site_name: Quant Trading 量化交易系统文档
+site_description: 基于 Python 的量化交易系统，支持实时市场数据流和策略回测
+site_author: tom-xue-dev
+site_url: https://DragonQuantt.github.io/docs
+
+repo_name: DragonQuantt/docs
+repo_url: https://github.com/DragonQuantt/docs
+edit_uri: edit/main/
+
+docs_dir: .
+site_dir: site
+
+theme:
+  name: material
+  language: zh
+  palette:
+  - media: "(prefers-color-scheme: light)"
+    scheme: default
+    primary: indigo
+    accent: indigo
+    toggle:
+      icon: material/brightness-7
+      name: 切换到深色模式
+  - media: "(prefers-color-scheme: dark)"
+    scheme: slate
+    primary: indigo
+    accent: indigo
+    toggle:
+      icon: material/brightness-4
+      name: 切换到浅色模式
+  features:
+  - navigation.instant
+  - navigation.tracking
+  - navigation.tabs
+  - navigation.tabs.sticky
+  - navigation.sections
+  - navigation.expand
+  - navigation.path
+  - navigation.indexes
+  - toc.follow
+  - toc.integrate
+  - navigation.top
+  - search.suggest
+  - search.highlight
+  - search.share
+  - content.code.copy
+  - content.code.annotate
+  - content.tabs.link
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+
+plugins:
+- search:
+    lang:
+    - zh
+    - en
+- section-index
+
+markdown_extensions:
+- pymdownx.highlight:
+    anchor_linenums: true
+    line_spans: __span
+    pygments_lang_class: true
+- pymdownx.inlinehilite
+- pymdownx.snippets
+- pymdownx.superfences:
+    custom_fences:
+    - name: mermaid
+      class: mermaid
+      format: !!python/name:pymdownx.superfences.fence_code_format ""
+- pymdownx.tabbed:
+    alternate_style: true
+- pymdownx.details
+- pymdownx.emoji:
+    emoji_index: !!python/name:material.extensions.emoji.twemoji ""
+    emoji_generator: !!python/name:material.extensions.emoji.to_svg ""
+- pymdownx.arithmatex:
+    generic: true
+- admonition
+- tables
+- attr_list
+- md_in_html
+- def_list
+- footnotes
+- toc:
+    permalink: true
+    toc_depth: 3
+
+extra:
+  social:
+  - icon: fontawesome/brands/github
+    link: https://github.com/DragonQuantt/docs
+
+extra_javascript:
+- javascripts/mathjax.js
+- https://polyfill.io/v3/polyfill.min.js?features=es6
+- https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+- 首页: index.md
+- 快速开始:
+  - getting-started/index.md
+  - 配置说明: getting-started/configuration.md
+- 架构设计:
+  - architecture/index.md
+- API 参考:
+  - api/index.md
+  - CLI 命令: api/cli.md
+  - WebSocket API: api/websocket.md
+  - HTTP API: api/http.md
+- 用户指南:
+  - guides/index.md
+- 开发指南:
+  - development/index.md
+- 部署运维:
+  - deployment/index.md
