@@ -75,7 +75,7 @@ main run-server --log-level debug
 **访问地址**
 
 - WebSocket: `ws://<host>:<port>/ws`
-- 健康检查: `http://<host>:<port>/health`
+- 健康检查: `http://<host>:<port>/api/v1/health`
 
 ## 测试客户端
 

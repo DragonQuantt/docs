@@ -1,201 +1,122 @@
 # HTTP API 参考
 
-RESTful HTTP 接口文档。
+本页采用最新 API 契约，与 `frontend/01_api_design.md` 保持一致。
 
 ## 基础信息
 
-- **Base URL**: `http://localhost:8080`
+- **开发环境 Base URL**: `http://localhost:8000`
+- **生产环境 Base URL**: `https://api.quant-trading.example.com`
 - **协议**: HTTP/1.1
-- **格式**: JSON
+- **格式**: `application/json`
 
-## 通用端点
+## 统一响应格式
 
-### 健康检查
-
-```
-GET /health
-```
-
-检查服务是否正常运行。
-
-**响应**:
+成功响应：
 
 ```json
 {
-  "status": "healthy"
+  "code": 0,
+  "message": "success",
+  "data": {},
+  "timestamp": "2026-03-02T12:00:00Z"
 }
 ```
 
-**状态码**: `200 OK`
-
----
-
-### 根端点
-
-```
-GET /
-```
-
-获取网关基本信息。
-
-**响应**:
+失败响应：
 
 ```json
 {
-  "message": "Quant Trading Gateway",
-  "status": "running"
+  "code": 40001,
+  "message": "Invalid request",
+  "data": null,
+  "timestamp": "2026-03-02T12:00:00Z"
 }
 ```
 
-**状态码**: `200 OK`
+错误码范围：
 
----
+| 范围 | 含义 |
+|------|------|
+| `0` | 成功 |
+| `40000-40099` | 请求参数错误 |
+| `40100-40199` | 认证/授权错误 |
+| `40400-40499` | 资源不存在 |
+| `50000-50099` | 服务内部错误 |
+| `50300-50399` | 上游服务不可用（Redis/交易所） |
 
-## API 文档
+## OpenAPI
 
-### OpenAPI 文档
+- `GET /docs` - Swagger UI
+- `GET /openapi.json` - OpenAPI Schema
 
-```
-GET /docs
-```
+浏览器访问：`http://localhost:8000/docs`
 
-交互式 API 文档（Swagger UI），提供可视化的接口测试界面。
+## 核心端点（分组）
 
-**浏览器访问**: `http://localhost:8080/docs`
+### Health
 
----
+- `GET /api/v1/health`
+- `GET /api/v1/health/pipeline`
 
-### OpenAPI Schema
+### Account
 
-```
-GET /openapi.json
-```
+- `GET /api/v1/account/balance`
+- `GET /api/v1/account/positions`
+- `GET /api/v1/account/open-orders`
 
-获取 OpenAPI 3.0 规范文件。
+### Strategy
 
----
+- `GET /api/v1/strategy/list`
+- `GET /api/v1/strategy/{name}/config`
+- `POST /api/v1/strategy/{name}/toggle`
+- `POST /api/v1/strategy/{name}/config`
+- `GET /api/v1/strategy/{name}/config/history`
 
-## 资产池 API
+### Risk
 
-### 获取现货交易对排名
+- `GET /api/v1/risk/status`
+- `GET /api/v1/risk/alerts`
+- `GET /api/v1/risk/config`
+- `POST /api/v1/risk/symbols/disable`
 
-```
-GET /v1/spot/top{top_k}/{days}days
-```
+### System
 
-根据过去 N 天的成交额获取 Top K 现货交易对列表。
+- `POST /api/v1/system/emergency-stop`
 
-**路径参数**:
+### Portfolio
 
-| 参数 | 类型 | 必需 | 说明 |
-|------|------|------|------|
-| `top_k` | integer | 是 | 返回前 K 个交易对（必须 > 0） |
-| `days` | integer | 是 | 统计天数（必须 > 0） |
+- `GET /api/v1/portfolio/nav`
+- `GET /api/v1/portfolio/pnl`
+- `GET /api/v1/portfolio/drawdown`
+- `GET /api/v1/portfolio/target-positions`
+- `GET /api/v1/portfolio/position-deviation`
+- `GET /api/v1/portfolio/volatility`
 
-**查询参数**:
+### Orders
 
-| 参数 | 类型 | 必需 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `exchange` | string | 否 | binance | CCXT 交易所 ID |
-| `quote_asset` | string | 否 | USDT | 计价币种过滤（如 USDT） |
-| `max_workers` | integer | 否 | 8 | 线程数（1-32） |
+- `GET /api/v1/orders/history`
+- `GET /api/v1/orders/rebalance-history`
+- `GET /api/v1/orders/trades`
 
-**请求示例**:
+### Signals
 
-```bash
-# 获取币安交易所过去 30 天成交额前 10 的 USDT 计价交易对
-GET /v1/spot/top10/30days?exchange=binance&quote_asset=USDT
+- `GET /api/v1/signals/latest`
+- `GET /api/v1/signals/coverage`
+- `GET /api/v1/signals/compare`
 
-# 获取 OKX 交易所过去 7 天成交额前 20 的交易对
-GET /v1/spot/top20/7days?exchange=okx&max_workers=16
-```
+### Backtest
 
-**响应示例**:
-
-```json
-{
-  "exchange": "binance",
-  "days": 30,
-  "top_k": 10,
-  "count": 10,
-  "items": [
-    {
-      "symbol": "BTC/USDT",
-      "base": "BTC",
-      "quote": "USDT",
-      "turnover": 125678901234.56
-    },
-    {
-      "symbol": "ETH/USDT",
-      "base": "ETH",
-      "quote": "USDT",
-      "turnover": 98765432109.87
-    }
-  ]
-}
-```
-
-**响应字段说明**:
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `exchange` | string | 交易所 ID |
-| `days` | integer | 统计天数 |
-| `top_k` | integer | 请求的数量 |
-| `count` | integer | 实际返回数量 |
-| `items` | array | 交易对列表 |
-| `items[].symbol` | string | 交易对符号（如 BTC/USDT） |
-| `items[].base` | string | 基础币种 |
-| `items[].quote` | string | 计价币种 |
-| `items[].turnover` | float | 成交额 |
-
-**状态码**:
-
-- `200` - 成功
-- `400` - 参数错误（如 top_k ≤ 0 或 days ≤ 0）
-- `500` - 服务器错误
-
----
+- `POST /api/v1/backtest/run`
+- `GET /api/v1/backtest/{backtest_id}/result`
+- `GET /api/v1/backtest/history`
 
 ## CORS 配置
 
-API 已启用 CORS（跨域资源共享），允许所有来源访问：
+开发环境可使用宽松策略；生产环境应限制 `allow_origins` 到前端实际域名。
 
-- **允许来源**: `*`（所有来源）
-- **允许凭证**: `true`
-- **允许方法**: `*`（所有 HTTP 方法）
-- **允许头部**: `*`（所有请求头）
+## 兼容性说明
 
----
+以下旧契约已废弃，不再作为主文档：
 
-## 错误响应
-
-标准错误格式：
-
-```json
-{
-  "detail": "错误描述信息"
-}
-```
-
-**常见错误示例**:
-
-```json
-{
-  "detail": "top_k must be greater than 0"
-}
-```
-
-```json
-{
-  "detail": "days must be greater than 0"
-}
-```
-
-**HTTP 状态码**:
-
-- `200` - 成功
-- `400` - 请求错误（参数验证失败）
-- `404` - 资源未找到
-- `422` - 实体无法处理（参数格式错误）
-- `500` - 服务器内部错误
+- `GET /health`
+- `GET /v1/spot/top{top_k}/{days}days`

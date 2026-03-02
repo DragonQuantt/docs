@@ -1,7 +1,7 @@
 # 工业级量化模拟盘 — 架构设计文档
 
 > 编写时间: 2026-03-02
-> 基于: 现有 V0 代码库 + strategy_1.md (Top 10 多因子策略) + strategy_2.md (baseline_rev 2h+4h 反转)
+> 基于: 现有 V0 代码库 + overview/strategy_1.md (Top 10 多因子策略) + overview/strategy_2.md (baseline_rev 2h+4h 反转)
 > 前置文档: `docs/overview/01_system_design_v1_v2.md`
 
 ---
@@ -134,7 +134,7 @@ class TargetPosition:
 
 ```python
 class BaselineRevStrategy(BaseStrategy):
-    """2h+4h 反转基准策略, 对应 strategy_2.md"""
+    """2h+4h 反转基准策略, 对应 overview/strategy_2.md"""
 
     def __init__(self, long_n: int = 30, short_n: int = 30):
         self.long_n = long_n
@@ -690,7 +690,7 @@ Monitor Service 每 30s 扫描:
 | **输出指标** | Sharpe, MDD, Calmar, 年化收益率, 换手率, NAV 曲线 |
 | **CLI** | `main backtest run --strategy baseline_rev --start 2024-01-01 --end 2025-01-01` |
 
-**回测核心循环 (对应 strategy_1.md Stage 6):**
+**回测核心循环 (对应 overview/strategy_1.md Stage 6):**
 
 ```python
 for date in all_trading_dates:

@@ -543,6 +543,65 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 }
 ```
 
+#### POST /api/v1/system/emergency-stop
+
+全局紧急停机。触发后立即阻断所有新下单与换仓请求。
+
+**请求体**:
+
+```json
+{
+  "confirm": true,
+  "reason": "交易所波动异常, 触发全局停机",
+  "operator": "admin"
+}
+```
+
+**状态写入**: Redis `quant:system:emergency_stop`, `quant:risk:status`
+
+**响应**:
+
+```json
+{
+  "data": {
+    "emergency_stop": true,
+    "trading_enabled": false,
+    "scope": "all_symbols",
+    "triggered_at": "2026-03-02T23:59:00Z",
+    "triggered_by": "admin"
+  }
+}
+```
+
+#### POST /api/v1/risk/symbols/disable
+
+关闭单个交易对交易。被停用的交易对将拒绝新订单, 但不自动平仓。
+
+**请求体**:
+
+```json
+{
+  "symbol": "BTC/USDT:USDT",
+  "reason": "该交易对盘口异常, 暂停交易",
+  "operator": "admin"
+}
+```
+
+**状态写入**: Redis `quant:risk:disabled_symbols`
+
+**响应**:
+
+```json
+{
+  "data": {
+    "symbol": "BTC/USDT:USDT",
+    "trading_enabled": false,
+    "disabled_at": "2026-03-02T23:59:00Z",
+    "disabled_by": "admin"
+  }
+}
+```
+
 #### GET /api/v1/risk/alerts
 
 告警历史 (分页)。
@@ -1317,7 +1376,8 @@ NAV 净值曲线。
 | `/api/v1/health/*` | MonitorService | `quant:heartbeat:*`, `quant:state:*` | `routes/health.py` |
 | `/api/v1/account/*` | AccountService | `quant:account:balance`, `quant:account:positions`, `quant:account:orders` | `routes/account.py` |
 | `/api/v1/strategy/*` | StrategyService | `quant:strategy:status:*`, `configs/strategy_config.yaml` | `routes/strategy.py` |
-| `/api/v1/risk/*` | RiskService | `quant:risk:status`, DB `alerts` | `routes/risk.py` |
+| `/api/v1/system/*` | RiskService | `quant:system:emergency_stop`, `quant:risk:status` | `routes/system.py` |
+| `/api/v1/risk/*` | RiskService | `quant:risk:status`, `quant:risk:disabled_symbols`, DB `alerts` | `routes/risk.py` |
 | `/api/v1/portfolio/*` | AccountService + FeatureService | `quant:signal:latest`, DB `portfolio_snapshots` | `routes/portfolio.py` |
 | `/api/v1/orders/*` | OrderService | DB `orders`, `trades`, `rebalance_events` | `routes/orders.py` |
 | `/api/v1/signals/*` | StrategyService + FeatureService | `quant:signal:latest`, DB `signal_snapshots` | `routes/signals.py` |
