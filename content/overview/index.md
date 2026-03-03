@@ -1,7 +1,7 @@
 # 系统设计方案 — V1 / V2 迭代规划
 
-> 编写时间: 2026-02-21
-> 基于: 00_overview.md 策略研究成果 + 现有代码架构 Review
+> 编写时间: 2026-03-03
+> 基于: 00_overview.md 策略研究成果 + 现有代码架构 Review + strategy_3.md (ofi_14d)
 
 ---
 
@@ -42,36 +42,21 @@
 
 ### V1 微服务拆分
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        V1 服务全景                               │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  [Asset Pool Service]     — 保持现状, 小幅优化                    │
-│         │                                                        │
-│         ▼ asset_pool_updated                                     │
-│  [Aggregator Service]     — 保持现状 (time-bar)                   │
-│         │                                                        │
-│         ▼ kline_aggregated                                       │
-│  [Feature Service]        — 扩展: 加入 Z-Score + 日内 ret 特征    │
-│         │                                                        │
-│         ▼ feature_calculated                                     │
-│  [Strategy Service] ★新   — 策略与下单解耦, 输出目标仓位           │
-│         │                                                        │
-│         ▼ signal_generated                                       │
-│  [Risk Service] ★新       — 风控检查, 仓位约束, 通过后 emit        │
-│         │                                                        │
-│         ▼ order_approved                                         │
-│  [Order Service] ★重构    — 纯执行层: 拆单/下单/重试               │
-│         │                                                        │
-│         ▼ order_executed                                         │
-│  [Account Service] ★新    — 实时同步余额/仓位/挂单                 │
-│                                                                  │
-│  [Backtest Engine] ★新    — 离线: 信号回放 + NAV 计算              │
-│  [Monitor Service] ★新    — 健康检查 + 异常告警                    │
-│  [API Gateway]            — 重构: 暴露 REST API 供前端/告警使用    │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph v1Services ["V1 服务全景"]
+        AssetPool["Asset Pool Service\n(保持现状)"]
+        AssetPool -->|asset_pool_updated| Aggregator["Aggregator Service\n(保持 time-bar)"]
+        Aggregator -->|kline_aggregated| Feature["Feature Service\n(+Z-Score +日内 ret)"]
+        Feature -->|feature_calculated| Strategy["Strategy Service ★新\n(策略与下单解耦)"]
+        Strategy -->|signal_generated| Risk["Risk Service ★新\n(风控检查)"]
+        Risk -->|order_approved| Order["Order Service ★重构\n(纯执行层)"]
+        Order -->|order_executed| Account["Account Service ★新\n(余额/仓位同步)"]
+
+        Backtest["Backtest Engine ★新\n(信号回放 + NAV)"]
+        MonitorV1["Monitor Service ★新\n(健康检查 + 告警)"]
+        Gateway["API Gateway\n(REST API)"]
+    end
 ```
 
 ### V1 各模块概要
@@ -102,15 +87,15 @@ GET  /api/v1/account/positions        — 当前持仓
 
 ### V1 Redis 事件流 (完整)
 
-```
-asset_pool_updated
-    → kline_aggregated
-        → feature_calculated
-            → signal_generated        ★ 新
-                → order_approved      ★ 新 (Risk 通过)
-                   or risk_rejected   ★ 新 (Risk 拒绝)
-                    → order_executed  ★ 新
-                        → account_updated  ★ 新
+```mermaid
+flowchart LR
+    A["asset_pool_updated"] --> B["kline_aggregated"]
+    B --> C["feature_calculated"]
+    C --> D["signal_generated ★"]
+    D --> E["order_approved ★"]
+    D -.-> F["risk_rejected ★"]
+    E --> G["order_executed ★"]
+    G --> H["account_updated ★"]
 ```
 
 ### V1 配置文件新增
@@ -157,54 +142,29 @@ configs/
 
 ### V2 微服务拆分
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        V2 服务全景                               │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  [Data Ingestion Service] ★新                                    │
-│       │  — 采集 aggTrades 逐笔成交                               │
-│       │  — 持久化到 TimescaleDB / Parquet                        │
-│       ▼                                                          │
-│  [Dollar Bar Service] ★新                                        │
-│       │  — 自适应阈值 (auto_K50_ema) dollar bar 聚合              │
-│       │  — 输出 23 列 enriched bar                               │
-│       ▼ dollar_bar_generated                                     │
-│  [Tick Feature Service] ★新                                      │
-│       │  — VPIN / Kyle's Lambda / Burstiness 等 9 个 tick 特征   │
-│       │  — rolling 50 bars window                                │
-│       ▼ tick_features_enriched                                   │
-│  [Feature Service] ★扩展                                         │
-│       │  — 日内特征 (1h/2h/4h/8h ret)                           │
-│       │  — Z-Score 标准化                                        │
-│       │  — 聚合 tick 特征 + 传统特征                              │
-│       ▼ feature_calculated                                       │
-│  [Strategy Service] ★扩展                                        │
-│       │  — 多策略并行 (rev_x_inv_vpin, regime_switch 等)          │
-│       │  — 策略组合/集成信号                                      │
-│       ▼ signal_generated                                         │
-│  [Risk Service] ★增强                                            │
-│       │  — 动态风控 (波动率自适应仓位)                             │
-│       │  — 策略间相关性检查                                       │
-│       ▼ order_approved                                           │
-│  [Order Service] ★增强                                           │
-│       │  — Limit Order 支持                                      │
-│       │  — TWAP/VWAP 拆单算法                                    │
-│       ▼ order_executed                                           │
-│  [Account Service]        — V1 基础上增加 PnL 归因                │
-│  [Backtest Engine] ★增强  — Dollar Bar 回测 + 策略组合回测         │
-│  [Monitor Service] ★增强  — 策略级监控 + 风控仪表盘                │
-│  [API Gateway] ★增强      — WebSocket 推送 + 策略管理 API         │
-│                                                                  │
-│  [Asset Pool Service]     — 增加多交易所支持                      │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph v2Services ["V2 服务全景"]
+        DataIngestion["Data Ingestion ★新\n(aggTrades 采集)"]
+        DataIngestion -->|aggTrade stream| DollarBar["Dollar Bar ★新\n(auto_K50_ema 聚合)"]
+        DollarBar -->|dollar_bar_generated| TickFeature["Tick Feature ★新\n(VPIN/Lambda 等 9 个)"]
+        TickFeature -->|tick_features_enriched| FeatureV2["Feature Service ★扩展\n(日内 ret + Z-Score + 日级聚合\n+ tick 融合 + ofi_14d)"]
+        FeatureV2 -->|feature_calculated| StrategyV2["Strategy Service ★扩展\n(多策略并行: 反转 + ofi_14d)"]
+        StrategyV2 -->|signal_generated| RiskV2["Risk Service ★增强\n(动态风控 + 相关性检查)"]
+        RiskV2 -->|order_approved| OrderV2["Order Service ★增强\n(Limit + TWAP)"]
+        OrderV2 -->|order_executed| AccountV2["Account Service\n(+PnL 归因)"]
+
+        BacktestV2["Backtest Engine ★增强\n(Dollar Bar + 组合回测)"]
+        MonitorV2["Monitor Service ★增强\n(策略级 + 风控仪表盘)"]
+        GatewayV2["API Gateway ★增强\n(WebSocket + 策略管理)"]
+        AssetPoolV2["Asset Pool Service\n(多池 T50 + 多交易所)"]
+    end
 ```
 
 ### V2 各模块概要
 
 > 各服务的详细设计（接口、配置、代码示例等）参见 `docs/architecture.md`。
-> 策略信号公式详见 `docs/overview/strategy_1.md` 和 `docs/overview/strategy_2.md`。
+> 策略信号公式详见 `docs/overview/strategy_1.md`、`docs/overview/strategy_2.md` 和 `docs/overview/strategy_3.md`。
 > 以下仅列出 V2 阶段的增量变更。
 
 | 模块 | 变更类型 | V2 核心变更 |
@@ -212,38 +172,27 @@ configs/
 | Data Ingestion Service | 新增 | aggTrade 采集 → TimescaleDB + Redis Stream |
 | Dollar Bar Service | 新增 | 自适应阈值 (auto_K50_ema) dollar bar，输出 23 列 |
 | Tick Feature Service | 新增 | 9 个微观特征 (VPIN / Kyle's Lambda 等)，rolling 50 bars |
-| Feature Service | 扩展 | 接入 `tick_features_enriched`，融合 tick + 传统特征 |
-| Strategy Service | 扩展 | 10 套策略上线 + ensemble 多策略并行 |
+| Feature Service | 扩展 | 接入 `tick_features_enriched`，融合 tick + 传统特征；新增日级聚合层 (ofi_d, dollar_volume_d) + 多日滚动特征 (ofi_14d) |
+| Asset Pool Service | 扩展 | 支持多种 pool profile: default Top-100 + 月度 T50 流动性池 (strategy_3 依赖) |
+| Strategy Service | 扩展 | 10 套反转/tick 策略 + ofi_14d 动量策略上线；ensemble 多策略并行；灵活换仓周期 (R1/R14) |
 | Risk Service | 增强 | 波动率自适应仓位、策略相关性检查、动态止损 |
 | Order Service | 增强 | Limit Order + TWAP 拆单 + 智能路由 |
 | Backtest Engine | 增强 | Dollar Bar 回测 + 策略组合回测 |
 
 ### V2 数据流 (完整)
 
-```
-[Data Ingestion] ──aggTrade──▶ TimescaleDB + Redis Stream
-                                      │
-                                      ▼
-[Dollar Bar Service] ──dollar_bar_generated──▶ Redis
-                                                │
-                                                ▼
-[Tick Feature Service] ──tick_features_enriched──▶ Redis
-                                                     │
-[Asset Pool Service] ──asset_pool_updated──┐         │
-                                           ▼         ▼
-                    [Feature Service] ◀─── 融合 ───────┘
-                           │
-                           ▼ feature_calculated
-                    [Strategy Service] (多策略并行)
-                           │
-                           ▼ signal_generated
-                    [Risk Service]
-                           │
-                           ▼ order_approved
-                    [Order Service]
-                           │
-                           ▼ order_executed
-                    [Account Service]
+```mermaid
+flowchart TD
+    Ingestion["Data Ingestion"] -->|aggTrade| Storage["TimescaleDB\n+ Redis Stream"]
+    Storage --> DBar["Dollar Bar Service"]
+    DBar -->|dollar_bar_generated| TFeat["Tick Feature Service"]
+    TFeat -->|tick_features_enriched| Merge(("融合"))
+    APool["Asset Pool Service"] -->|asset_pool_updated| Merge
+    Merge --> Feat["Feature Service\n(日内 ret + 日级聚合 + ofi_14d)"]
+    Feat -->|feature_calculated| Strat["Strategy Service\n(多策略并行)"]
+    Strat -->|signal_generated| RiskNode["Risk Service"]
+    RiskNode -->|order_approved| OrdNode["Order Service"]
+    OrdNode -->|order_executed| AccNode["Account Service"]
 ```
 
 ### V2 注意要点
@@ -270,39 +219,77 @@ configs/
 
 ## 迭代路线图
 
-```
-V0 (当前)                    V1                           V2
-──────────                ──────────                  ──────────
-✅ 基础管线               策略/执行解耦                 aggTrade 采集
-✅ 简单策略               风控服务                     Dollar Bar 聚合
-✅ Redis Pub/Sub          账户服务                     Tick 微观特征
-✅ Docker/ECS             回测引擎                     10 套策略上线
-                          监控告警                     多策略集成
-                          Z-Score 特征                 动态风控
-                          API Gateway                  Limit/TWAP 下单
-                          测试覆盖                     Kafka (可选)
-                          ─────────                    ─────────
-                          ~6-8 周                      ~10-14 周
+```mermaid
+gantt
+    title 迭代路线图
+    dateFormat YYYY-MM-DD
+    axisFormat %m月
+
+    section V0 (已完成)
+    基础管线 + 简单策略 + Redis + Docker/ECS :done, v0, 2026-01-01, 2026-02-15
+
+    section V1 (~6-8 周)
+    策略/执行解耦           :v1a, 2026-03-01, 2w
+    风控服务               :v1b, after v1a, 1w
+    账户服务               :v1c, 2026-03-01, 2w
+    Feature 扩展 (Z-Score)  :v1d, 2026-03-01, 2w
+    回测引擎               :v1e, after v1d, 2w
+    监控告警               :v1f, after v1c, 1w
+    API Gateway 重构        :v1g, after v1f, 1w
+    测试覆盖               :v1h, after v1e, 1w
+
+    section V2 (~10-14 周)
+    Data Ingestion          :v2a, after v1h, 2w
+    Dollar Bar 聚合         :v2b, after v2a, 2w
+    Tick 微观特征           :v2c, after v2b, 2w
+    Feature V2 (日级聚合 + ofi_14d) :v2d, after v2c, 2w
+    Asset Pool 多池扩展     :v2e, after v1h, 2w
+    策略实现 (反转 + ofi_14d) :v2f, after v2d, 2w
+    多策略集成 + 动态风控    :v2g, after v2f, 2w
 ```
 
 ### 依赖关系
 
-```
-V1-1: Strategy Service 重构 (无外部依赖, 最先开始)
-V1-2: Risk Service (依赖 V1-1 的 TargetPortfolio 接口)
-V1-3: Order Service 重构 (依赖 V1-2 的 order_approved 事件)
-V1-4: Account Service (独立, 可与 V1-1 并行)
-V1-5: Feature Service 扩展 (独立, 可与 V1-1 并行)
-V1-6: Backtest Engine (依赖 V1-1 和 V1-5)
-V1-7: Monitor Service (依赖 V1-4, 可在最后集成)
-V1-8: API Gateway 重构 (依赖所有服务就绪)
+```mermaid
+flowchart TD
+    subgraph V1 ["V1 依赖图"]
+        V1_1["V1-1: Strategy Service 重构"]
+        V1_2["V1-2: Risk Service"]
+        V1_3["V1-3: Order Service 重构"]
+        V1_4["V1-4: Account Service"]
+        V1_5["V1-5: Feature Service 扩展"]
+        V1_6["V1-6: Backtest Engine"]
+        V1_7["V1-7: Monitor Service"]
+        V1_8["V1-8: API Gateway 重构"]
 
-V2-1: Data Ingestion Service (独立, 可提前启动)
-V2-2: Dollar Bar Service (依赖 V2-1)
-V2-3: Tick Feature Service (依赖 V2-2)
-V2-4: Feature Service V2 扩展 (依赖 V2-3)
-V2-5: 策略实现 (依赖 V2-4)
-V2-6: 多策略集成 + 风控增强 (依赖 V2-5)
+        V1_1 --> V1_2
+        V1_2 --> V1_3
+        V1_1 --> V1_6
+        V1_5 --> V1_6
+        V1_4 --> V1_7
+        V1_3 --> V1_8
+        V1_7 --> V1_8
+    end
+
+    subgraph V2 ["V2 依赖图"]
+        V2_1["V2-1: Data Ingestion"]
+        V2_2["V2-2: Dollar Bar Service"]
+        V2_3["V2-3: Tick Feature Service"]
+        V2_4["V2-4: Feature V2\n(日级聚合 + ofi_14d)"]
+        V2_5["V2-5: Asset Pool 多池扩展"]
+        V2_6["V2-6: 策略实现\n(反转系列 + ofi_14d)"]
+        V2_7["V2-7: 多策略集成\n+ 风控增强"]
+
+        V2_1 --> V2_2
+        V2_2 --> V2_3
+        V2_3 --> V2_4
+        V2_4 --> V2_6
+        V2_5 --> V2_6
+        V2_6 --> V2_7
+    end
+
+    V1_8 --> V2_1
+    V1_8 --> V2_5
 ```
 
 ---

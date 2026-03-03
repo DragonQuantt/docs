@@ -1,7 +1,7 @@
 # 工业级量化模拟盘 — 架构设计文档
 
-> 编写时间: 2026-03-02
-> 基于: 现有 V0 代码库 + overview/strategy_1.md (Top 10 多因子策略) + overview/strategy_2.md (baseline_rev 2h+4h 反转)
+> 编写时间: 2026-03-03
+> 基于: 现有 V0 代码库 + overview/strategy_1.md (Top 10 多因子策略) + overview/strategy_2.md (baseline_rev 2h+4h 反转) + overview/strategy_3.md (ofi_14d 单因子动量)
 > 前置文档: `docs/overview/01_system_design_v1_v2.md`
 
 ---
@@ -33,37 +33,40 @@
 
 ### 1.2 整体架构图（双输入、单输出契约）
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                            数据管线 (Data Pipeline)                           │
-│                                                                               │
-│  输入路径 A: tick 聚合                                                        │
-│  AssetPool -> DataIngestion(aggTrade) -> DollarBar -> TickFeature            │
-│                                                                               │
-│  输入路径 B: 直拉 kline                                                       │
-│  AssetPool -> DirectKline(REST/WS)                                            │
-│                                                                               │
-│                    两路汇合 -> BarSourceAdapter(统一 Bar 契约)               │
-│                               emit: bar_normalized                            │
-│                                           │                                   │
-│                                           ▼                                   │
-│                     Feature Service (ret/zscore/融合特征)                     │
-│                               emit: feature_calculated                        │
-└───────────────────────────────────────────┬───────────────────────────────────┘
-                                            │
-┌───────────────────────────────────────────┼───────────────────────────────────┐
-│                                           ▼                                   │
-│                         交易管线 (Trading Pipeline)                            │
-│                                                                               │
-│  Strategy Service -> Risk Service -> Order Service -> Account Service         │
-│     signal_generated   order_approved      order_executed      account_updated│
-│                       / risk_rejected                                         │
-└───────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph dataPipeline ["数据管线 (Data Pipeline)"]
+        direction TB
+        subgraph pathA ["输入路径 A: tick 聚合"]
+            AssetPoolA["AssetPool"] --> DataIngestion["DataIngestion\n(aggTrade)"]
+            DataIngestion --> DollarBar["DollarBar"]
+            DollarBar --> TickFeature["TickFeature"]
+        end
+        subgraph pathB ["输入路径 B: 直拉 kline"]
+            AssetPoolB["AssetPool"] --> DirectKline["DirectKline\n(REST/WS)"]
+        end
+        TickFeature --> BarSourceAdapter["BarSourceAdapter\n(统一 Bar 契约)"]
+        DirectKline --> BarSourceAdapter
+        BarSourceAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
+        FeatureService -->|feature_calculated| outputData((" "))
+    end
 
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                                   基础设施层                                  │
-│     Redis (Streams + Pub/Sub + 状态键) + TimescaleDB + Monitor + API Gateway │
-└───────────────────────────────────────────────────────────────────────────────┘
+    subgraph tradingPipeline ["交易管线 (Trading Pipeline)"]
+        direction LR
+        StrategyService["Strategy Service"] -->|signal_generated| RiskService["Risk Service"]
+        RiskService -->|order_approved| OrderService["Order Service"]
+        RiskService -.->|risk_rejected| AlertPath((" "))
+        OrderService -->|order_executed| AccountService["Account Service"]
+    end
+
+    subgraph infra ["基础设施层"]
+        Redis["Redis\n(Streams + Pub/Sub + 状态键)"]
+        TimescaleDB["TimescaleDB"]
+        Monitor["Monitor"]
+        APIGateway["API Gateway"]
+    end
+
+    outputData --> StrategyService
 ```
 
 ### 1.2.1 关键约束
@@ -77,11 +80,15 @@
 
 **现有问题**: `FuturesOrderService` 将策略逻辑 (`_rank_by_momentum`) 和下单逻辑 (`_open_positions`, `_close_all_positions`) 耦合在同一个类中。无法独立测试策略、无法复用到回测、无法同时运行多策略。
 
-**解耦方案**: 引入 `BaseStrategy` 抽象接口，所有策略（包括 strategy_1 的 Top 10 和 strategy_2 的 baseline_rev）实现相同接口:
+**解耦方案**: 引入 `BaseStrategy` 抽象接口，所有策略（包括 strategy_1 的 Top 10、strategy_2 的 baseline_rev、strategy_3 的 ofi_14d）实现相同接口:
 
 ```python
 class BaseStrategy(ABC):
     """所有策略必须实现此接口。回测和实盘共用同一套代码。"""
+
+    rebalance_interval: int = 1       # 换仓周期（交易日数），R1=1, R14=14
+    pool_name: str = "default"        # 使用的资产池名称
+    min_history_days: int = 0         # 最少历史天数要求（不足则过滤）
 
     @abstractmethod
     def generate_signal(
@@ -91,6 +98,12 @@ class BaseStrategy(ABC):
         timestamp: datetime,
     ) -> TargetPortfolio:
         """输入特征 → 输出目标仓位权重"""
+
+    def should_skip_rebalance(
+        self, n_candidates: int, cross_section_std: float
+    ) -> bool:
+        """子类可覆写，定义跳过换仓的条件。"""
+        return False
 
 @dataclass
 class TargetPortfolio:
@@ -155,71 +168,42 @@ class BaselineRevStrategy(BaseStrategy):
         )
 ```
 
-**strategy_1 (Top 10 系列) 需要的策略基类扩展:**
+**策略汇总表 (strategy_1 / strategy_2 / strategy_3):**
 
-Top 10 策略共享相同的 `BaseStrategy` 接口，区别仅在 `generate_signal` 内部的信号构造逻辑:
+所有策略共享相同的 `BaseStrategy` 接口，区别仅在 `generate_signal` 内部的信号构造逻辑、换仓周期和所用资产池:
 
-| 策略 | 信号公式 | 所需特征 |
-|------|---------|---------|
-| rev_x_inv_vpin | `mean(z2h,z4h) × clip(1 - 0.3·vpin_z, 0.3, 1.7)` (详见 strategy_1.md) | ret_2h, ret_4h, tick_vpin_24h |
-| rev_vpin_filter_t1.0 | `zscore_neg_ret_2h` 仅保留 `zscore_vpin > 1.0` | ret_2h, tick_vpin |
-| rev_jump_filter_t1.0 | `zscore_neg_ret_2h` 仅保留 `zscore_jump > 1.0` | ret_2h, tick_jump_ratio |
-| regime_switch | 高波做趋势, 低波做反转 | ret_2h, volatility |
-| baseline_rev | `mean(zscore_neg_ret_2h, zscore_neg_ret_4h)` | ret_2h, ret_4h |
+| 策略 | 来源 | 信号公式 | 所需特征 | 换仓 | 资产池 |
+|------|------|---------|---------|------|--------|
+| rev_x_inv_vpin | strategy_1 Top 1 | `mean(z2h,z4h) × clip(1 - 0.3·vpin_z, 0.3, 1.7)` | ret_2h, ret_4h, tick_vpin_24h | R1 | default |
+| rev_vpin_filter_t1.0 | strategy_1 Top 2/3 | `zscore_neg_ret_2h` 仅保留 `zscore_vpin > 1.0` | ret_2h, tick_vpin | R1 | default |
+| rev_jump_filter_t1.0 | strategy_1 Top 4/5 | `zscore_neg_ret_2h` 仅保留 `zscore_jump > 1.0` | ret_2h, tick_jump_ratio | R1 | default |
+| regime_switch | strategy_1 Top 7 | 高波做趋势, 低波做反转 | ret_2h, volatility | R1 | default |
+| baseline_rev | strategy_2 | `mean(zscore_neg_ret_2h, zscore_neg_ret_4h)` | ret_2h, ret_4h | R1 | default |
+| ofi_14d | strategy_3 | `zscore(RM_14(ofi_d))` 截面多空 | ofi_d, ofi_14d, dollar_volume_d | R14 | t50_monthly |
 
 ### 1.4 事件流设计 (完整)
 
-```
-asset_pool_updated                                    (AssetPoolService 发布)
-    │
-    ├──▶ DataIngestionService                         tick 输入路径
-    │       │
-    │       ├── write stream: quant:stream:aggTrades:{symbol}
-    │       ▼
-    │    DollarBarService
-    │       │
-    │       └── dollar_bar_generated
-    │               ▼
-    │            TickFeatureService
-    │               │
-    │               └── tick_features_enriched
-    │
-    └──▶ DirectKlineService                           直拉 kline 输入路径
-            │
-            └── kline_raw
+```mermaid
+flowchart TD
+    AssetPoolUpdated["asset_pool_updated\n(AssetPoolService)"]
 
-tick_features_enriched 或 kline_raw
-    │
-    ▼
-BarSourceAdapter                                      统一 Bar 契约 + 模式切换
-    │
-    ├── bar_normalized                                主输出（下游唯一入口）
-    └── bar_source_mismatch                           hybrid 对账偏差告警
+    AssetPoolUpdated -->|tick 路径| DataIngestion["DataIngestionService"]
+    DataIngestion -->|"quant:stream:aggTrades"| DollarBarSvc["DollarBarService"]
+    DollarBarSvc -->|dollar_bar_generated| TickFeatureSvc["TickFeatureService"]
+    TickFeatureSvc -->|tick_features_enriched| BarAdapter["BarSourceAdapter\n(统一 Bar 契约)"]
 
-bar_normalized
-    │
-    ▼
-FeatureService                                        融合特征 + zscore
-    │
-    └── feature_calculated
-            │
-            ▼
-         StrategyService                              多策略并行计算
-            │
-            └── signal_generated
-                    │
-                    ▼
-                 RiskService                          风控检查
-                    │
-                    ├── order_approved               (通过)
-                    │       │
-                    │       ▼
-                    │    OrderService                差量下单
-                    │       │
-                    │       ├── order_executed
-                    │       └── order_failed
-                    │
-                    └── risk_rejected                (拒绝 -> 告警)
+    AssetPoolUpdated -->|kline 路径| DirectKline["DirectKlineService"]
+    DirectKline -->|kline_raw| BarAdapter
+
+    BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
+    BarAdapter -.->|bar_source_mismatch| MonitorAlert["MonitorService"]
+
+    FeatureSvc -->|feature_calculated| StrategySvc["StrategyService\n(多策略并行)"]
+    StrategySvc -->|signal_generated| RiskSvc["RiskService"]
+    RiskSvc -->|order_approved| OrderSvc["OrderService\n(差量下单)"]
+    RiskSvc -.->|risk_rejected| MonitorAlert
+    OrderSvc -->|order_executed| AccountSvc["AccountService"]
+    OrderSvc -.->|order_failed| MonitorAlert
 ```
 ### 1.5 故障隔离与恢复策略
 
@@ -366,6 +350,8 @@ quant_trading/
 │   │   │   ├── feature_calculator.py     # 基础技术指标 (保持)
 │   │   │   ├── zscore_calculator.py      ★ Z-Score 标准化
 │   │   │   ├── intraday_features.py      ★ 日内 ret (1h/2h/4h/8h)
+│   │   │   ├── daily_aggregator.py       ★ bar → 日级聚合 (ofi_d, dollar_volume_d)
+│   │   │   ├── rolling_features.py       ★ 多日滚动特征 (ofi_14d)
 │   │   │   └── service.py
 │   │   │
 │   │   ├── strategy_service/             ★ [新增] 策略引擎
@@ -381,7 +367,8 @@ quant_trading/
 │   │   │   │   ├── rev_noise_boost.py    # strategy_1 Top 6
 │   │   │   │   ├── regime_switch.py      # strategy_1 Top 7
 │   │   │   │   ├── vol_weighted_blend.py # strategy_1 Top 8
-│   │   │   │   └── quad_blend.py         # strategy_1 Top 9
+│   │   │   │   ├── quad_blend.py         # strategy_1 Top 9
+│   │   │   │   └── ofi_14d.py            ★ strategy_3: OFI 14d 动量
 │   │   │   ├── ensemble.py              ★ 多策略集成
 │   │   │   └── service.py
 │   │   │
@@ -432,9 +419,11 @@ quant_trading/
     ├── unit/
     │   ├── test_strategies/              ★ 策略单测
     │   │   ├── test_baseline_rev.py
-    │   │   └── test_rev_x_inv_vpin.py
+    │   │   ├── test_rev_x_inv_vpin.py
+    │   │   └── test_ofi_14d.py           ★
     │   ├── test_risk_rules.py            ★
     │   ├── test_zscore.py                ★
+    │   ├── test_daily_aggregator.py      ★
     │   ├── test_backtest_engine.py        ★
     │   └── ...
     └── integration/
@@ -444,17 +433,56 @@ quant_trading/
 
 ### 2.2 各服务详细职责
 
-#### 2.2.1 Asset Pool Service (保持)
+#### 2.2.1 Asset Pool Service (扩展 — 多池支持)
 
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/asset_pool_service/service.py` |
 | **订阅事件** | 无 (publish-only) |
 | **发布事件** | `asset_pool_updated` |
-| **核心逻辑** | 按 30 日 USDT 成交额排名, 筛选 Top-K 合约 |
-| **调度** | 每 24h 执行一次, 启动时立即执行 |
-| **Redis 键** | `quant:asset_pool:{exchange}` (Set) |
-| **变更** | 无, 保持现有实现 |
+| **核心逻辑** | 支持多种 pool profile，按不同指标/周期筛选合约池 |
+| **调度** | `default` 池每 24h 更新; `t50_monthly` 池每月 1 日更新 |
+| **Redis 键** | `quant:asset_pool:{exchange}` (Set, default), `quant:asset_pool:{exchange}:t50_monthly` (Set) |
+| **变更** | 新增多池配置、月度流动性池计算逻辑 |
+
+**多池配置 (asset_pool_config.yaml 扩展):**
+
+```yaml
+pools:
+  default:
+    top_k: 100
+    metric: usdt_volume_30d
+    update_interval: 24h
+  t50_monthly:
+    top_k: 50
+    metric: dollar_volume_monthly   # 按月统计 sum(dollar_volume_d)
+    lag: 1                          # 使用上月数据 (1 个月滞后)
+    update_interval: monthly        # 每月 1 日更新
+    min_history_days: 60            # 历史不足 60 天的标的排除
+```
+
+**月度流动性池 T50 计算逻辑 (对应 strategy_3.md Section 4.1):**
+
+```python
+def compute_monthly_pool(
+    daily_dollar_volumes: Dict[str, Dict[date, float]],
+    target_month: date,
+    top_k: int = 50,
+    min_history_days: int = 60,
+) -> List[str]:
+    """
+    按上月 dollar_volume 总和降序取 Top-K，
+    同时过滤历史不足 min_history_days 的标的。
+    """
+    monthly_totals = {}
+    for symbol, date_to_dv in daily_dollar_volumes.items():
+        month_days = [d for d in date_to_dv if d.month == target_month.month and d.year == target_month.year]
+        if len(date_to_dv) < min_history_days:
+            continue
+        monthly_totals[symbol] = sum(date_to_dv[d] for d in month_days)
+    ranked = sorted(monthly_totals.items(), key=lambda x: x[1], reverse=True)
+    return [sym for sym, _ in ranked[:top_k]]
+```
 
 #### 2.2.2 Data Ingestion Service (新增)
 
@@ -511,11 +539,51 @@ quant_trading/
 | **上游输入** | `tick_features_enriched` 或 `kline_raw` |
 | **适配输出** | `bar_normalized`（统一 Bar 契约，含 source 字段） |
 | **发布事件** | `feature_calculated` |
-| **核心逻辑** | 先归一化 Bar（OHLCV/时间边界/时区），再计算 ret/zscore/融合特征 |
+| **核心逻辑** | 先归一化 Bar（OHLCV/时间边界/时区），再计算 ret/zscore/融合特征；新增日级聚合 + 多日滚动特征 |
 | **部署形态** | `BarSourceAdapter` 可独立进程部署，也可作为 FeatureService 内嵌模块 |
 | **Hybrid 对账** | 双路并行时比较 OHLCV 偏差，超阈值发布 `bar_source_mismatch` |
-| **新增文件** | `bar_source_adapter.py`, `zscore_calculator.py`, `intraday_features.py` |
-| **Redis 键** | `quant:features:latest:{symbol}`（保持） |
+| **新增文件** | `bar_source_adapter.py`, `zscore_calculator.py`, `intraday_features.py`, `daily_aggregator.py` ★, `rolling_features.py` ★ |
+| **Redis 键** | `quant:features:latest:{symbol}`（保持）, `quant:features:daily:{symbol}` ★（日级特征缓存） |
+
+**日级聚合层 (daily_aggregator.py) — 对应 strategy_3.md Section 2.3/3.2:**
+
+Bar 级特征在每日 EOD (23:59 UTC) 聚合为日级特征，供中低频策略（如 ofi_14d）消费:
+
+| 日级字段 | 聚合公式 | 来源 |
+|---------|---------|------|
+| `close_d` | 当日最后一根 bar 的 `close` | bar OHLCV |
+| `ret_d` | `close_d / close_{d-1} - 1` | close_d |
+| `ofi_d` | 当日所有 bar `buy_sell_imbalance` 的均值 | Dollar Bar 23 列 |
+| `dollar_volume_d` | 当日所有 bar `dollar_volume` 之和 | Dollar Bar 23 列 |
+
+```python
+def aggregate_daily_features(
+    bars_today: List[BarNormalized],
+    prev_close: float,
+) -> DailyFeatures:
+    """将当日所有 bar 聚合为日级特征。"""
+    close_d = bars_today[-1].close
+    ret_d = close_d / prev_close - 1 if prev_close > 0 else float("nan")
+    ofi_d = np.nanmean([b.buy_sell_imbalance for b in bars_today])
+    dollar_volume_d = sum(b.dollar_volume for b in bars_today)
+    return DailyFeatures(close_d=close_d, ret_d=ret_d, ofi_d=ofi_d, dollar_volume_d=dollar_volume_d)
+```
+
+**多日滚动特征 (rolling_features.py) — 对应 strategy_3.md Section 3.3:**
+
+```python
+def rolling_mean(values: List[float], window: int = 14) -> float:
+    """
+    滚动均值，有效值条件: count_valid >= max(floor(w/2), 3)。
+    """
+    recent = values[-window:]
+    valid = [v for v in recent if not math.isnan(v)]
+    if len(valid) < max(window // 2, 3):
+        return float("nan")
+    return sum(valid) / len(valid)
+```
+
+`ofi_14d` 因子由 `rolling_mean(ofi_d_series, window=14)` 计算得出。
 
 **Z-Score 计算 (关键):**
 
@@ -546,7 +614,8 @@ def calculate_zscore(values: List[float], window: int = 30, negate: bool = False
 | **发布事件** | `signal_generated` |
 | **核心逻辑** | 加载配置中指定的策略, 调用 `generate_signal()`, 输出 TargetPortfolio |
 | **多策略支持** | StrategyRegistry 注册表 + ensemble 加权聚合 |
-| **调度** | 事件驱动 + cron 兜底 (每日 23:59 UTC) |
+| **调度** | 按策略独立换仓周期调度: R1 策略每日 23:59 UTC 触发, R14 策略每 14 个交易日触发 |
+| **资产池路由** | 根据策略配置的 `pool_name` 从对应的 Redis 池键读取候选标的 |
 
 **策略注册表设计:**
 
@@ -572,6 +641,94 @@ class BaselineRevStrategy(BaseStrategy): ...
 
 @StrategyRegistry.register("rev_x_inv_vpin")
 class RevXInvVpinStrategy(BaseStrategy): ...
+
+@StrategyRegistry.register("ofi_14d")
+class Ofi14dStrategy(BaseStrategy): ...
+```
+
+**strategy_3 (ofi_14d) 实现示例:**
+
+```python
+@StrategyRegistry.register("ofi_14d")
+class Ofi14dStrategy(BaseStrategy):
+    """OFI 14 日动量策略, 对应 overview/strategy_3.md"""
+
+    rebalance_interval = 14
+    pool_name = "t50_monthly"
+    min_history_days = 60
+
+    def __init__(self, long_n: int = 15, short_n: int = 15, min_candidates: int = 30):
+        self.long_n = long_n
+        self.short_n = short_n
+        self.min_candidates = min_candidates
+
+    def generate_signal(self, features, current_positions, timestamp):
+        signals = {}
+        for symbol, feat in features.items():
+            ofi_14d_value = feat.get("ofi_14d")
+            if ofi_14d_value is not None and not math.isnan(ofi_14d_value):
+                signals[symbol] = ofi_14d_value
+
+        if self.should_skip_rebalance(len(signals), self._cross_section_std(signals)):
+            return TargetPortfolio(
+                positions={}, strategy_name="ofi_14d",
+                signal_timestamp=timestamp, metadata={"skipped": True},
+            )
+
+        ranked = sorted(signals.items(), key=lambda x: x[1])
+        weight_long = 0.5 / self.long_n
+        weight_short = 0.5 / self.short_n
+
+        positions = {}
+        for symbol, val in ranked[-self.long_n:]:
+            positions[symbol] = TargetPosition(
+                symbol=symbol, side="long",
+                weight=+weight_long, signal_value=val, reason="ofi_14d_long",
+            )
+        for symbol, val in ranked[:self.short_n]:
+            positions[symbol] = TargetPosition(
+                symbol=symbol, side="short",
+                weight=-weight_short, signal_value=val, reason="ofi_14d_short",
+            )
+        return TargetPortfolio(
+            positions=positions, strategy_name="ofi_14d",
+            signal_timestamp=timestamp, metadata={"n_candidates": len(signals)},
+        )
+
+    def should_skip_rebalance(self, n_candidates: int, cross_section_std: float) -> bool:
+        if n_candidates < self.min_candidates:
+            return True
+        if cross_section_std < 1e-10:
+            return True
+        return False
+
+    @staticmethod
+    def _cross_section_std(signals: Dict[str, float]) -> float:
+        if not signals:
+            return 0.0
+        values = list(signals.values())
+        mean_val = sum(values) / len(values)
+        return (sum((v - mean_val) ** 2 for v in values) / len(values)) ** 0.5
+```
+
+**StrategyService 灵活换仓调度:**
+
+```python
+class StrategyService:
+    def on_feature_calculated(self, features, timestamp):
+        trading_day_index = self._get_trading_day_index(timestamp)
+
+        for strategy_config in self.active_strategies:
+            strategy = StrategyRegistry.create(strategy_config.name, **strategy_config.parameters)
+            rebalance_interval = strategy.rebalance_interval
+
+            if trading_day_index > 0 and trading_day_index % rebalance_interval != 0:
+                continue
+
+            pool_symbols = self._load_pool(strategy.pool_name)
+            filtered_features = {s: features[s] for s in pool_symbols if s in features}
+            target = strategy.generate_signal(filtered_features, self.current_positions, timestamp)
+            self.emit_signal(target)
 ```
 
 **多策略集成配置 (strategy_config.yaml):**
@@ -583,7 +740,7 @@ active_strategy: baseline_rev
 parameters:
   long_n: 30
   short_n: 30
-  rebalance: R1  # 每日换仓
+  rebalance_days: 1             # R1 = 每日换仓
 
 # 或: 多策略集成模式
 # mode: ensemble
@@ -591,10 +748,23 @@ parameters:
 # strategies:
 #   - name: rev_x_inv_vpin
 #     weight: 0.3
+#     pool: default
+#     rebalance_days: 1
 #     parameters: { long_n: 10, short_n: 10 }
 #   - name: baseline_rev
-#     weight: 0.7
+#     weight: 0.3
+#     pool: default
+#     rebalance_days: 1
 #     parameters: { long_n: 30, short_n: 30 }
+#   - name: ofi_14d
+#     weight: 0.4
+#     pool: t50_monthly
+#     rebalance_days: 14
+#     parameters:
+#       long_n: 15
+#       short_n: 15
+#       min_candidates: 30
+#       min_history_days: 60
 ```
 
 #### 2.2.8 Risk Service (新增)
@@ -728,6 +898,9 @@ for date in all_trading_dates:
 | `quant:dollar_bar:{symbol}` | List | Dollar Bar 缓存 (最近 200 bars) |
 | `quant:kline:raw:{symbol}:{timeframe}` | String (JSON) | 直拉 kline 最新快照 |
 | `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 |
+| `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
+| `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
+| `quant:features:rolling:{symbol}` | String (JSON) | ★ 多日滚动特征缓存 (ofi_14d 等) |
 | `quant:account:balance` | String (JSON) | 账户余额快照 |
 | `quant:account:positions` | String (JSON) | 当前持仓快照 |
 | `quant:account:orders` | String (JSON) | 活跃挂单快照 |
@@ -803,37 +976,31 @@ CloudWatch:
 
 ### 3.3 网络架构
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                        VPC (10.0.0.0/16)                   │
-│                                                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │            Public Subnet (10.0.1.0/24)               │  │
-│  │                                                      │  │
-│  │  ┌─────────────┐   ┌──────────────┐                 │  │
-│  │  │ NAT Gateway │   │ ALB (可选)   │                 │  │
-│  │  └─────────────┘   └──────────────┘                 │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │           Private Subnet (10.0.10.0/24)              │  │
-│  │                                                      │  │
-│  │  ┌──────────────┐  ┌──────────────┐                 │  │
-│  │  │ ECS Fargate  │  │ ECS Fargate  │  ... (所有服务) │  │
-│  │  │ Service 1    │  │ Service 2    │                 │  │
-│  │  └──────────────┘  └──────────────┘                 │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │            Data Subnet (10.0.20.0/24)                │  │
-│  │                                                      │  │
-│  │  ┌──────────────┐  ┌──────────────┐                 │  │
-│  │  │ ElastiCache  │  │ RDS          │                 │  │
-│  │  │ Redis        │  │ TimescaleDB  │                 │  │
-│  │  └──────────────┘  └──────────────┘                 │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph VPC ["VPC (10.0.0.0/16)"]
+        subgraph publicSubnet ["Public Subnet (10.0.1.0/24)"]
+            NAT["NAT Gateway"]
+            ALB["ALB (可选)"]
+        end
+        subgraph privateSubnet ["Private Subnet (10.0.10.0/24)"]
+            ECS1["ECS Fargate\nService 1"]
+            ECS2["ECS Fargate\nService 2"]
+            ECSn["... 所有服务"]
+        end
+        subgraph dataSubnet ["Data Subnet (10.0.20.0/24)"]
+            RedisNode["ElastiCache\nRedis"]
+            RDS["RDS\nTimescaleDB"]
+        end
+    end
+
+    Internet(("Internet")) --> ALB
+    ALB -->|8000| ECS1
+    ECS1 --> RedisNode
+    ECS1 --> RDS
+    ECS1 -->|via NAT| Internet
+    ECS2 --> RedisNode
+    ECS2 --> RDS
 ```
 
 **安全组规则:**
@@ -873,28 +1040,21 @@ ECS Task Definition 通过 `secrets` 字段引用:
 
 ### 3.5 CI/CD 流程 (扩展)
 
-现有的 GitHub Actions workflow 只部署单容器。扩展为多服务部署:
+现有的 GitHub Actions workflow 只部署单容器。扩展为多服务部署（每个服务独立的 ECS Task Definition，但共用同一个 Docker 镜像，区别仅在 command 参数不同）:
 
-```
-main branch push
-    │
-    ▼
-GitHub Actions
-    │
-    ├── Build Docker Image → Push to ECR (一个镜像, 不同 command)
-    │
-    ├── Deploy asset-pool-service      (command: trading asset-pool)
-    ├── Deploy aggregator-service      (command: trading aggregator)
-    ├── Deploy feature-service         (command: trading feature)
-    ├── Deploy strategy-service        (command: trading strategy)
-    ├── Deploy risk-service            (command: trading risk)
-    ├── Deploy order-service           (command: trading futures)
-    ├── Deploy account-service         (command: trading account --daemon)
-    ├── Deploy monitor-service         (command: trading monitor)
-    └── Deploy api-gateway             (command: system server)
-
-每个服务独立的 ECS Task Definition, 但共用同一个 Docker 镜像。
-区别仅在 command 参数不同。
+```mermaid
+flowchart LR
+    Push["main branch push"] --> GHA["GitHub Actions"]
+    GHA --> Build["Build Docker Image\n+ Push to ECR"]
+    Build --> D1["asset-pool-service\n(trading asset-pool)"]
+    Build --> D2["aggregator-service\n(trading aggregator)"]
+    Build --> D3["feature-service\n(trading feature)"]
+    Build --> D4["strategy-service\n(trading strategy)"]
+    Build --> D5["risk-service\n(trading risk)"]
+    Build --> D6["order-service\n(trading futures)"]
+    Build --> D7["account-service\n(trading account --daemon)"]
+    Build --> D8["monitor-service\n(trading monitor)"]
+    Build --> D9["api-gateway\n(system server)"]
 ```
 
 ### 3.6 Terraform 模块结构
@@ -1003,27 +1163,21 @@ module "ecs" {
 
 ### 4.3 推荐方案
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     通信总线分层架构                       │
-│                                                          │
-│  高频数据层: Redis Streams                               │
-│  ─────────────────────────────                           │
-│  aggTrade → DollarBarService                             │
-│  场景: 120K msg/s, 需持久化 + 消费者组 + 背压控制        │
-│  键: quant:stream:aggTrades:{symbol}                     │
-│  MAXLEN: ~100,000 (每 symbol)                            │
-│                                                          │
-│  低频事件层: Redis Pub/Sub                               │
-│  ────────────────────────                                │
-│  asset_pool_updated, feature_calculated,                 │
-│  signal_generated, order_approved, ...                   │
-│  场景: <10 msg/min, 不需持久化, 需广播                   │
-│  复用现有 BaseEventService 抽象                          │
-│                                                          │
-│  ❌ 暂不引入 Kafka                                      │
-│  理由: 见 4.4                                            │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph highFreq ["高频数据层: Redis Streams"]
+        aggTrade["aggTrade tick 数据"] -->|"120K msg/s"| Stream["Redis Stream\n(quant:stream:aggTrades)"]
+        Stream -->|消费者组| DollarBarConsumer["DollarBarService"]
+    end
+
+    subgraph lowFreq ["低频事件层: Redis Pub/Sub"]
+        Events["asset_pool_updated\nfeature_calculated\nsignal_generated\norder_approved ..."]
+        Events -->|"<10 msg/min\n广播模式"| PubSub["Redis Pub/Sub\n(BaseEventService)"]
+    end
+
+    subgraph notUsed ["暂不引入"]
+        Kafka["Apache Kafka\n(详见 4.4)"]
+    end
 ```
 
 ### 4.4 为什么暂不引入 Kafka?
@@ -1098,27 +1252,33 @@ async def consume_trades(self, symbol: str):
 
 ## 附录 A: 策略兼容性矩阵 {#appendix-a}
 
-本架构同时兼容 strategy_1 (Top 10 多因子) 和 strategy_2 (baseline_rev):
+本架构同时兼容 strategy_1 (Top 10 多因子)、strategy_2 (baseline_rev) 和 strategy_3 (ofi_14d):
 
-| 数据/特征需求 | strategy_2 (baseline_rev) | strategy_1 (Top 10) | 提供服务 |
-|-------------|:---:|:---:|------|
-| 资产池筛选 | ✅ | ✅ | AssetPoolService |
-| 直拉 Kline (1m OHLCV) | ✅ (可选) | ✅ (无 tick 因子策略) | DirectKlineService |
-| Tick 聚合输入 (aggTrade) | ✅ (可选) | ✅ | DataIngestionService |
-| Tick 聚合 Bar (Dollar/Time) | ✅ (可选) | ✅ | DollarBarService |
-| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | TickFeatureService |
-| 日内 ret (1h/2h/4h/8h) | ✅ (2h, 4h) | ✅ | FeatureService |
-| Z-Score 标准化 | ✅ | ✅ | FeatureService |
-| 多策略并行 | 单策略 | 多策略集成 | StrategyService |
-| 风控检查 | ✅ | ✅ | RiskService |
-| 市价单执行 | ✅ | ✅ | OrderService |
+| 数据/特征需求 | strategy_2 (baseline_rev) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | 提供服务 |
+|-------------|:---:|:---:|:---:|------|
+| 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService |
+| 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService (扩展) |
+| 直拉 Kline (1m OHLCV) | ✅ (可选) | ✅ (无 tick 因子策略) | ✅ (可选) | DirectKlineService |
+| Tick 聚合输入 (aggTrade) | ✅ (可选) | ✅ | ✅ (Dollar Bar 来源) | DataIngestionService |
+| Tick 聚合 Bar (Dollar Bar) | ✅ (可选) | ✅ | ✅ (buy_sell_imbalance) | DollarBarService |
+| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | TickFeatureService |
+| 日内 ret (1h/2h/4h/8h) | ✅ (2h, 4h) | ✅ | ❌ | FeatureService |
+| 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
+| 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
+| Z-Score 标准化 | ✅ | ✅ | ✅ (截面) | FeatureService |
+| 历史长度过滤 (≥60 天) | ❌ | ❌ | ✅ | AssetPoolService / StrategyService |
+| 灵活换仓周期 | R1 | R1 | R14 | StrategyService |
+| 多策略并行 | 单策略 | 多策略集成 | 可独立或集成 | StrategyService |
+| 风控检查 | ✅ | ✅ | ✅ | RiskService |
+| 市价单执行 | ✅ | ✅ | ✅ | OrderService |
 
 **分阶段实施:**
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
 | **V1** (MVP) | strategy_2 (baseline_rev) | AssetPool + DirectKline + Feature + Strategy + Risk + Order |
-| **V2** (双源统一架构) | strategy_1 + strategy_2 全部 | 上述 + DataIngestion + DollarBar + TickFeature + BarSourceAdapter |
+| **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d 简化版，用直拉 kline 聚合日级 OFI) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
+| **V2** (双源统一架构) | strategy_1 + strategy_2 + strategy_3 全部 | V1 + DataIngestion + DollarBar + TickFeature + BarSourceAdapter |
 
 ## 附录 B: Terraform 模块清单 {#appendix-b}
 
@@ -1136,6 +1296,23 @@ async def consume_trades(self, symbol: str):
 ---
 
 ## 附录 C: 配置文件模板
+
+### asset_pool_config.yaml
+
+```yaml
+pools:
+  default:
+    top_k: 100
+    metric: usdt_volume_30d
+    update_interval: 24h
+
+  t50_monthly:
+    top_k: 50
+    metric: dollar_volume_monthly
+    lag: 1                        # 使用上月数据
+    update_interval: monthly
+    min_history_days: 60          # 历史不足 60 天排除
+```
 
 ### strategy_config.yaml
 
@@ -1155,21 +1332,35 @@ bar_source:
 parameters:
   long_n: 30
   short_n: 30
-  rebalance_days: 1            # R1 = 每日换仓
+  rebalance_days: 1             # R1 = 每日换仓
 
 # 多策略集成 (mode: ensemble 时生效)
+# mode: ensemble
 # ensemble_method: weighted_average
 # strategies:
 #   - name: rev_x_inv_vpin
 #     weight: 0.3
+#     pool: default
+#     rebalance_days: 1
 #     parameters:
 #       long_n: 10
 #       short_n: 10
 #   - name: baseline_rev
-#     weight: 0.7
+#     weight: 0.3
+#     pool: default
+#     rebalance_days: 1
 #     parameters:
 #       long_n: 30
 #       short_n: 30
+#   - name: ofi_14d
+#     weight: 0.4
+#     pool: t50_monthly
+#     rebalance_days: 14
+#     parameters:
+#       long_n: 15
+#       short_n: 15
+#       min_candidates: 30
+#       min_history_days: 60
 
 # 调度
 cron_enabled: true
