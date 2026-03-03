@@ -38,14 +38,14 @@ flowchart TD
     subgraph dataPipeline ["数据管线 (Data Pipeline)"]
         direction TB
         subgraph pathA ["输入路径 A: tick 聚合"]
-            AssetPoolA["AssetPool"] --> DataIngestion["DataIngestion\n(aggTrade)"]
+            AssetPoolA["AssetPool"] --> DataIngestion["DataIngestion(aggTrade)"]
             DataIngestion --> DollarBar["DollarBar"]
             DollarBar --> TickFeature["TickFeature"]
         end
         subgraph pathB ["输入路径 B: 直拉 kline"]
-            AssetPoolB["AssetPool"] --> DirectKline["DirectKline\n(REST/WS)"]
+            AssetPoolB["AssetPool"] --> DirectKline["DirectKline"]
         end
-        TickFeature --> BarSourceAdapter["BarSourceAdapter\n(统一 Bar 契约)"]
+        TickFeature --> BarSourceAdapter["BarSourceAdapter(统一 Bar 契约)"]
         DirectKline --> BarSourceAdapter
         BarSourceAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
         FeatureService -->|feature_calculated| outputData((" "))
