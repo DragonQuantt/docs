@@ -29,71 +29,49 @@
 | **故障隔离** | 单服务崩溃不拖垮整个系统 | 独立进程/容器 + Redis 状态缓存 + 自动重启 |
 | **幂等恢复** | 服务重启后能从 Redis 缓存恢复状态 | 每个服务启动时从 Redis 加载最新状态 |
 | **配置驱动** | 所有参数通过 YAML + 环境变量注入 | Pydantic Settings + YAML config |
+| **双输入单输出** | 同时支持 tick 聚合与直拉 kline，但下游只消费统一 Bar 契约 | Source Adapter 归一化 + `bar_normalized` 事件 |
 
-### 1.2 整体架构图
+### 1.2 整体架构图（双输入、单输出契约）
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          数据管线 (Data Pipeline)                        │
-│                                                                         │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐          │
-│  │ Asset Pool   │───▶│ Data         │───▶│ Dollar Bar       │          │
-│  │ Service      │    │ Ingestion    │    │ Service          │          │
-│  │              │    │ Service      │    │ (或 Time Bar)    │          │
-│  └──────┬───────┘    └──────────────┘    └────────┬─────────┘          │
-│         │                                         │                     │
-│         │ asset_pool_updated          dollar_bar_generated              │
-│         │                                         │                     │
-│         │                                         ▼                     │
-│         │                              ┌──────────────────┐            │
-│         │                              │ Tick Feature     │            │
-│         │                              │ Service          │            │
-│         │                              └────────┬─────────┘            │
-│         │                                       │                       │
-│         │                          tick_features_enriched               │
-│         │                                       │                       │
-│         ▼                                       ▼                       │
-│  ┌──────────────────────────────────────────────────────┐              │
-│  │              Feature Service (融合层)                  │              │
-│  │  日频聚合 + 日内 ret (1h/2h/4h/8h) + Z-Score          │              │
-│  └──────────────────────┬───────────────────────────────┘              │
-│                         │                                               │
-│                         │ feature_calculated                            │
-└─────────────────────────┼───────────────────────────────────────────────┘
-                          │
-┌─────────────────────────┼───────────────────────────────────────────────┐
-│                         ▼                                               │
-│             交易管线 (Trading Pipeline)                                  │
-│                                                                         │
-│  ┌──────────────────┐    ┌──────────────┐    ┌──────────────┐          │
-│  │ Strategy Service │───▶│ Risk Service │───▶│ Order Service│          │
-│  │ (多策略并行)     │    │              │    │ (纯执行层)   │          │
-│  └──────────────────┘    └──────────────┘    └──────┬───────┘          │
-│         │                       │                    │                   │
-│  signal_generated      order_approved        order_executed             │
-│                        or risk_rejected              │                   │
-│                                                      ▼                   │
-│                                          ┌──────────────────┐          │
-│                                          │ Account Service  │          │
-│                                          │ (状态同步)       │          │
-│                                          └──────────────────┘          │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                            数据管线 (Data Pipeline)                           │
+│                                                                               │
+│  输入路径 A: tick 聚合                                                        │
+│  AssetPool -> DataIngestion(aggTrade) -> DollarBar -> TickFeature            │
+│                                                                               │
+│  输入路径 B: 直拉 kline                                                       │
+│  AssetPool -> DirectKline(REST/WS)                                            │
+│                                                                               │
+│                    两路汇合 -> BarSourceAdapter(统一 Bar 契约)               │
+│                               emit: bar_normalized                            │
+│                                           │                                   │
+│                                           ▼                                   │
+│                     Feature Service (ret/zscore/融合特征)                     │
+│                               emit: feature_calculated                        │
+└───────────────────────────────────────────┬───────────────────────────────────┘
+                                            │
+┌───────────────────────────────────────────┼───────────────────────────────────┐
+│                                           ▼                                   │
+│                         交易管线 (Trading Pipeline)                            │
+│                                                                               │
+│  Strategy Service -> Risk Service -> Order Service -> Account Service         │
+│     signal_generated   order_approved      order_executed      account_updated│
+│                       / risk_rejected                                         │
+└───────────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         基础设施层                                       │
-│                                                                         │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  ┌───────────────┐ │
-│  │  Redis   │  │ TimescaleDB  │  │ Monitor       │  │ API Gateway   │ │
-│  │ (总线+   │  │ (持久化)     │  │ Service       │  │ (REST/WS)     │ │
-│  │  缓存)   │  │              │  │ (健康+告警)   │  │               │ │
-│  └──────────┘  └──────────────┘  └───────────────┘  └───────────────┘ │
-│                                                                         │
-│  ┌───────────────────────────────────────────┐                         │
-│  │ Backtest Engine (离线, 复用 BaseStrategy)  │                         │
-│  └───────────────────────────────────────────┘                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                                   基础设施层                                  │
+│     Redis (Streams + Pub/Sub + 状态键) + TimescaleDB + Monitor + API Gateway │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 1.2.1 关键约束
+
+1. 两种输入模式必须产出同一 `Bar` 结构（时间边界、时区、字段语义一致）。
+2. 下游 `Feature/Strategy/Risk/Order` 不感知数据来源，只消费 `bar_normalized`。
+3. 支持 `tick_agg | direct_kline | hybrid` 三种运行模式。
+4. `hybrid` 模式下必须做 shadow 对账（OHLCV 偏差监控）并支持自动降级。
 
 ### 1.3 策略与执行解耦: BaseStrategy 抽象
 
@@ -183,7 +161,7 @@ Top 10 策略共享相同的 `BaseStrategy` 接口，区别仅在 `generate_sign
 
 | 策略 | 信号公式 | 所需特征 |
 |------|---------|---------|
-| rev_x_inv_vpin | `zscore_neg_ret_2h × (1 / zscore_vpin)` | ret_2h, tick_vpin |
+| rev_x_inv_vpin | `mean(z2h,z4h) × clip(1 - 0.3·vpin_z, 0.3, 1.7)` (详见 strategy_1.md) | ret_2h, ret_4h, tick_vpin_24h |
 | rev_vpin_filter_t1.0 | `zscore_neg_ret_2h` 仅保留 `zscore_vpin > 1.0` | ret_2h, tick_vpin |
 | rev_jump_filter_t1.0 | `zscore_neg_ret_2h` 仅保留 `zscore_jump > 1.0` | ret_2h, tick_jump_ratio |
 | regime_switch | 高波做趋势, 低波做反转 | ret_2h, volatility |
@@ -192,49 +170,57 @@ Top 10 策略共享相同的 `BaseStrategy` 接口，区别仅在 `generate_sign
 ### 1.4 事件流设计 (完整)
 
 ```
-asset_pool_updated                   (AssetPoolService 发布)
+asset_pool_updated                                    (AssetPoolService 发布)
     │
-    ├──▶ AggregatorService           订阅 → 更新 symbol 列表
+    ├──▶ DataIngestionService                         tick 输入路径
     │       │
-    │       │ kline_aggregated       (仅 V1 time-bar 模式)
-    │       ▼
-    │    FeatureService
-    │
-    ├──▶ DataIngestionService        订阅 → 更新 aggTrade 订阅列表
-    │       │
-    │       │ (Redis Stream)
+    │       ├── write stream: quant:stream:aggTrades:{symbol}
     │       ▼
     │    DollarBarService
     │       │
-    │       │ dollar_bar_generated
-    │       ▼
-    │    TickFeatureService
-    │       │
-    │       │ tick_features_enriched
-    │       ▼
-    │    FeatureService              融合 tick 特征 + 日内 ret + Z-Score
+    │       └── dollar_bar_generated
+    │               ▼
+    │            TickFeatureService
+    │               │
+    │               └── tick_features_enriched
     │
-    └──▶ feature_calculated          (FeatureService 发布)
+    └──▶ DirectKlineService                           直拉 kline 输入路径
             │
-            ▼
-         StrategyService             多策略并行计算
-            │
-            │ signal_generated
-            ▼
-         RiskService                 风控检查
-            │
-            ├─ order_approved        (通过)
-            │     │
-            │     ▼
-            │  OrderService          差量下单
-            │     │
-            │     │ order_executed
-            │     ▼
-            │  AccountService        同步仓位/余额
-            │
-            └─ risk_rejected         (拒绝 → 告警)
-```
+            └── kline_raw
 
+tick_features_enriched 或 kline_raw
+    │
+    ▼
+BarSourceAdapter                                      统一 Bar 契约 + 模式切换
+    │
+    ├── bar_normalized                                主输出（下游唯一入口）
+    └── bar_source_mismatch                           hybrid 对账偏差告警
+
+bar_normalized
+    │
+    ▼
+FeatureService                                        融合特征 + zscore
+    │
+    └── feature_calculated
+            │
+            ▼
+         StrategyService                              多策略并行计算
+            │
+            └── signal_generated
+                    │
+                    ▼
+                 RiskService                          风控检查
+                    │
+                    ├── order_approved               (通过)
+                    │       │
+                    │       ▼
+                    │    OrderService                差量下单
+                    │       │
+                    │       ├── order_executed
+                    │       └── order_failed
+                    │
+                    └── risk_rejected                (拒绝 -> 告警)
+```
 ### 1.5 故障隔离与恢复策略
 
 | 故障场景 | 隔离机制 | 恢复策略 |
@@ -262,6 +248,9 @@ asset_pool_updated                   (AssetPoolService 发布)
    - `quant:state:{service_name}:last_run` — 上次执行时间戳
    - `quant:state:{service_name}:status` — running / idle / error
    - 启动时检查 last_run, 若距今超过阈值则立即补执行
+4. **双源对账与自动降级**:
+   - `hybrid` 模式下并行消费 `tick_agg` 与 `direct_kline`
+   - 若 `bar_source_mismatch` 连续超阈值，自动降级到 `direct_kline`
 
 ---
 
@@ -477,7 +466,7 @@ quant_trading/
 | **核心逻辑** | 接入 Binance Futures aggTrade WebSocket, 批量写入 TimescaleDB + Redis Stream |
 | **容量** | 488 symbols × ~250 ticks/s (峰值) ≈ 120K ticks/s |
 | **背压控制** | 内存缓冲 + 每 1s 或 1000 条批量 flush |
-| **兼容性** | strategy_1 全部需要, strategy_2 不需要 (可降级到 time-bar 模式) |
+| **兼容性** | `tick_agg` / `hybrid` 模式启用 |
 
 #### 2.2.3 Dollar Bar Service (新增)
 
@@ -489,7 +478,7 @@ quant_trading/
 | **核心逻辑** | 按累计 dollar_volume 切分 bar, 阈值 auto_K50_ema 自适应, 输出 23 列 |
 | **Redis 键** | `quant:dollar_bar:{symbol}` (List, 保留最近 200 bars) |
 | **冷启动** | 预加载最近 7 天 aggTrade 生成种子 bar, 确定初始阈值 |
-| **兼容性** | strategy_1 全部需要 |
+| **兼容性** | `tick_agg` / `hybrid` 模式启用 |
 
 #### 2.2.4 Tick Feature Service (新增)
 
@@ -501,27 +490,32 @@ quant_trading/
 | **核心逻辑** | 对每根 dollar bar, 取 rolling 50 bars 的 tick window, 计算 9 个微观特征 |
 | **计算特征** | tick_vpin, tick_toxicity_run_mean/max/ratio, tick_kyle_lambda, tick_burstiness, tick_jump_ratio, tick_whale_imbalance/impact |
 | **性能要求** | 使用 NumPy/Polars 向量化, 避免 Python 循环 |
-| **兼容性** | strategy_1 的 Top 1-7 需要, strategy_2 不需要 |
+| **兼容性** | Top 1-7 策略依赖；baseline_rev 可选 |
 
-#### 2.2.5 Aggregator Service (保持)
+#### 2.2.5 Direct Kline Service (基于 Aggregator 扩展)
 
 | 属性 | 值 |
 |------|-----|
-| **现有文件** | `services/aggregator_service/service.py` |
-| **角色** | V1 的数据入口 (time-bar 模式), V2 中作为 Dollar Bar 的降级备选 |
-| **变更** | 无, 保持现有实现。V2 中可选择性禁用 |
+| **现有文件** | `services/aggregator_service/service.py`（扩展） |
+| **订阅事件** | `asset_pool_updated` |
+| **发布事件** | `kline_raw` |
+| **核心逻辑** | 直接从交易所 REST/WS 拉取 kline（1m/5m/1h 等），按统一字段输出 |
+| **降级角色** | 当 tick 链路异常时可作为降级主源 |
+| **兼容性** | `direct_kline` / `hybrid` 模式启用 |
 
-#### 2.2.6 Feature Service (扩展)
+#### 2.2.6 Bar Source Adapter + Feature Service (扩展)
 
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/feature_service/service.py` |
-| **订阅事件** | `kline_aggregated` (V1) 或 `tick_features_enriched` (V2) |
+| **上游输入** | `tick_features_enriched` 或 `kline_raw` |
+| **适配输出** | `bar_normalized`（统一 Bar 契约，含 source 字段） |
 | **发布事件** | `feature_calculated` |
-| **V1 扩展** | 新增 Z-Score 标准化 (30 日 rolling, shift(1)), 日内 ret (1h/2h/4h/8h) |
-| **V2 扩展** | 融合 tick 微观特征 + 传统特征, 日频聚合 |
-| **新增文件** | `zscore_calculator.py`, `intraday_features.py` |
-| **Redis 键** | `quant:features:latest:{symbol}` (保持) |
+| **核心逻辑** | 先归一化 Bar（OHLCV/时间边界/时区），再计算 ret/zscore/融合特征 |
+| **部署形态** | `BarSourceAdapter` 可独立进程部署，也可作为 FeatureService 内嵌模块 |
+| **Hybrid 对账** | 双路并行时比较 OHLCV 偏差，超阈值发布 `bar_source_mismatch` |
+| **新增文件** | `bar_source_adapter.py`, `zscore_calculator.py`, `intraday_features.py` |
+| **Redis 键** | `quant:features:latest:{symbol}`（保持） |
 
 **Z-Score 计算 (关键):**
 
@@ -543,7 +537,6 @@ def calculate_zscore(values: List[float], window: int = 30, negate: bool = False
     zscore = (current - mean) / std
     return -zscore if negate else zscore
 ```
-
 #### 2.2.7 Strategy Service (新增)
 
 | 属性 | 值 |
@@ -716,7 +709,10 @@ for date in all_trading_dates:
 | 通道 | 发布者 | 订阅者 |
 |------|-------|-------|
 | `quant:dollar_bar_generated` | DollarBarService | TickFeatureService |
-| `quant:tick_features_enriched` | TickFeatureService | FeatureService |
+| `quant:tick_features_enriched` | TickFeatureService | BarSourceAdapter |
+| `quant:kline_raw` | DirectKlineService | BarSourceAdapter |
+| `quant:bar_normalized` | BarSourceAdapter | FeatureService |
+| `quant:bar_source_mismatch` | BarSourceAdapter | MonitorService |
 | `quant:signal_generated` | StrategyService | RiskService |
 | `quant:order_approved` | RiskService | OrderService |
 | `quant:risk_rejected` | RiskService | MonitorService |
@@ -730,14 +726,17 @@ for date in all_trading_dates:
 |-------|------|------|
 | `quant:stream:aggTrades:{symbol}` | Stream | aggTrade 实时数据 (MAXLEN ~100000) |
 | `quant:dollar_bar:{symbol}` | List | Dollar Bar 缓存 (最近 200 bars) |
+| `quant:kline:raw:{symbol}:{timeframe}` | String (JSON) | 直拉 kline 最新快照 |
+| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 |
 | `quant:account:balance` | String (JSON) | 账户余额快照 |
 | `quant:account:positions` | String (JSON) | 当前持仓快照 |
+| `quant:account:orders` | String (JSON) | 活跃挂单快照 |
+| `quant:portfolio:snapshot` | String (JSON) | NAV / PnL / 回撤等组合指标快照 |
 | `quant:signal:latest` | String (JSON) | 最新策略信号 |
 | `quant:heartbeat:{service}` | String (JSON + TTL) | 服务心跳 |
 | `quant:state:{service}:last_run` | String | 上次执行时间戳 |
 
 ---
-
 ## 三、AWS 部署方案 {#aws-deployment}
 
 ### 3.1 是否使用 Terraform?
@@ -1104,9 +1103,9 @@ async def consume_trades(self, symbol: str):
 | 数据/特征需求 | strategy_2 (baseline_rev) | strategy_1 (Top 10) | 提供服务 |
 |-------------|:---:|:---:|------|
 | 资产池筛选 | ✅ | ✅ | AssetPoolService |
-| Time Bar (1m OHLCV) | ✅ (可选) | ❌ | AggregatorService |
-| aggTrade 逐笔成交 | ❌ | ✅ | DataIngestionService |
-| Dollar Bar (23 列) | ❌ | ✅ | DollarBarService |
+| 直拉 Kline (1m OHLCV) | ✅ (可选) | ✅ (无 tick 因子策略) | DirectKlineService |
+| Tick 聚合输入 (aggTrade) | ✅ (可选) | ✅ | DataIngestionService |
+| Tick 聚合 Bar (Dollar/Time) | ✅ (可选) | ✅ | DollarBarService |
 | Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | TickFeatureService |
 | 日内 ret (1h/2h/4h/8h) | ✅ (2h, 4h) | ✅ | FeatureService |
 | Z-Score 标准化 | ✅ | ✅ | FeatureService |
@@ -1118,8 +1117,8 @@ async def consume_trades(self, symbol: str):
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
-| **V1** (当前架构 + 扩展) | strategy_2 (baseline_rev) | AssetPool + Aggregator + Feature (扩展) + Strategy + Risk + Order |
-| **V2** (完整数据管线) | strategy_1 + strategy_2 全部 | 上述 + DataIngestion + DollarBar + TickFeature |
+| **V1** (MVP) | strategy_2 (baseline_rev) | AssetPool + DirectKline + Feature + Strategy + Risk + Order |
+| **V2** (双源统一架构) | strategy_1 + strategy_2 全部 | 上述 + DataIngestion + DollarBar + TickFeature + BarSourceAdapter |
 
 ## 附录 B: Terraform 模块清单 {#appendix-b}
 
@@ -1143,6 +1142,14 @@ async def consume_trades(self, symbol: str):
 ```yaml
 mode: single                    # single | ensemble
 active_strategy: baseline_rev
+
+# 数据源模式
+bar_source:
+  mode: hybrid                  # tick_agg | direct_kline | hybrid
+  timeframe: 1m
+  compare_enabled: true         # hybrid 下启用双路对账
+  compare_tolerance_bps: 5      # OHLCV 偏差阈值（bps）
+  fallback_on_mismatch: true    # 偏差超阈值时自动降级到 direct_kline
 
 # 单策略参数
 parameters:
@@ -1168,7 +1175,6 @@ parameters:
 cron_enabled: true
 cron_schedule: "59 23 * * *"    # 每日 23:59 UTC (same_day 模式)
 ```
-
 ### risk_config.yaml
 
 ```yaml
@@ -1198,3 +1204,6 @@ webhook:
   url: ""                       # Telegram Bot API URL
   channel_id: ""                # Telegram Chat ID
 ```
+
+
+

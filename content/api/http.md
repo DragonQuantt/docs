@@ -1,6 +1,7 @@
 # HTTP API 参考
 
 本页采用最新 API 契约，与 `frontend/01_api_design.md` 保持一致。
+说明：本页仅描述对外 REST 接口；服务间内部事件通信请参考 [Redis 事件总线](redis.md)。
 
 ## 基础信息
 

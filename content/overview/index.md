@@ -74,150 +74,30 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### V1 各模块详细设计
+### V1 各模块概要
 
-#### 1. Strategy Service (新增)
+> 各服务的详细设计（接口、事件流、配置模板等）参见 `docs/architecture.md`。
+> 以下仅列出 V1 阶段每个模块的核心变更点。
 
-**职责:** 将"策略逻辑"从 `FuturesOrderService` 中抽离, 使策略可插拔。
-
-```python
-# 核心抽象
-class BaseStrategy(ABC):
-    @abstractmethod
-    def generate_signal(self, features: Dict[str, Dict]) -> TargetPortfolio:
-        """输入特征, 输出目标仓位权重"""
-
-class TargetPortfolio:
-    positions: Dict[str, TargetPosition]  # symbol -> {side, weight, reason}
-    signal_timestamp: datetime
-    strategy_name: str
-```
-
-**V1 内置策略:**
-- `MomentumReversalStrategy` — 从现有 FuturesOrderService 迁移
-- `BaselineRevStrategy` — 00_overview 中排名第 10 的 baseline_rev (2h+4h), 作为对照组
-
-**关键设计:**
-- 策略只输出目标权重 (e.g. `{"BTC/USDT:USDT": +0.1, "ETH/USDT:USDT": -0.1}`), 不涉及下单
-- 通过 YAML 配置切换策略: `strategy: momentum_reversal`
-- 策略通过 `signal_generated` 事件将目标仓位传给 Risk Service
-
-#### 2. Risk Service (新增)
-
-**职责:** 在策略信号到达 Order Service 前进行风控检查。
-
-**V1 风控规则:**
-
-| 规则 | 说明 | 默认值 |
-|------|------|--------|
-| max_position_pct | 单币种最大仓位占比 | 15% |
-| max_total_exposure | 最大总敞口 (多头+空头绝对值之和) | 100% |
-| max_drawdown_halt | 触发暂停交易的最大回撤 | 30% |
-| min_balance_reserve | 最低保留余额 (USDT) | 100 |
-| max_order_value | 单笔订单最大金额 | 5000 USDT |
-| blacklist | 禁止交易的币种 | [] |
-
-**事件流:**
-```
-signal_generated → Risk Service 检查 →
-  通过 → emit order_approved
-  拒绝 → emit risk_rejected + 告警
-```
-
-#### 3. Order Service (重构)
-
-**职责:** 从现有的"策略+下单一体"重构为纯执行层。
-
-**V1 改进:**
-- 接收 `order_approved` 事件中的目标仓位, 计算差量订单 (当前仓位 vs 目标仓位)
-- 增加下单重试机制 (指数退避, 最多 3 次)
-- 增加 amount 精度处理 (按交易所 precision 规则 round)
-- 支持 dry-run 模式 (记录但不实际下单)
-- 下单结果通过 `order_executed` 事件广播
-
-#### 4. Account Service (新增)
-
-**职责:** 统一管理账户状态, 供其他服务查询。
-
-**实现方式:**
-- 定时轮询 (30s 间隔) Binance REST API 获取:
-  - 账户余额 (`fetch_balance`)
-  - 当前持仓 (`fetch_positions`)
-  - 活跃挂单 (`fetch_open_orders`)
-- 数据缓存到 Redis:
-  - `quant:account:balance` — JSON
-  - `quant:account:positions` — JSON
-  - `quant:account:orders` — JSON
-- 其他服务读 Redis 即可, 无需各自调交易所 API
-- 余额/仓位变化时 emit `account_updated` 事件
-
-#### 5. Feature Service (扩展)
-
-**V1 新增特征:**
-
-| 特征 | 计算方式 | 来源 |
-|------|---------|------|
-| ret_1h, ret_2h, ret_4h, ret_8h | 日内不同窗口的收益率 | 00_overview Stage 4 |
-| zscore_momentum_N | momentum 的 30 日 rolling z-score | 00_overview Stage 5 |
-| zscore_volatility_N | volatility 的 30 日 rolling z-score | 00_overview Stage 5 |
-
-**关键:** Z-Score 计算时 `shift(1)` 避免 look-ahead bias。
-
-#### 6. Backtest Engine (新增)
-
-**职责:** 离线回测, 验证策略有效性。
-
-**设计:**
-```
-┌───────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Historical   │───▶│   Strategy   │───▶│   Backtest   │
-│  Data Loader  │    │  (same code) │    │   Engine     │
-└───────────────┘    └──────────────┘    └──────────────┘
-                                               │
-                                    ┌──────────┴──────────┐
-                                    │   Report Generator  │
-                                    │  Sharpe / MDD /     │
-                                    │  Calmar / Turnover  │
-                                    └─────────────────────┘
-```
-
-**核心原则:** 策略代码在回测和实盘中完全复用 (BaseStrategy 接口统一)。
-
-**V1 回测功能:**
-- 数据源: 从 Redis 或 CSV/Parquet 加载历史 kline
-- IS/OOS 分割: 支持按日期切分
-- 费用模型: 固定手续费率 (默认 10bps)
-- 换手计算: `turnover = Σ|target_weight - old_weight|`
-- 输出指标: Sharpe, MDD, Calmar, 年化收益率, 换手率, NAV 曲线
-- CLI 入口: `python -m quant_trading.app.cli backtest --strategy momentum_reversal --start 2024-01-01`
-
-#### 7. Monitor Service (新增)
-
-**V1 监控能力:**
-
-| 监控项 | 方式 | 告警渠道 |
-|--------|------|---------|
-| 服务存活 | 各服务定期向 Redis 写 heartbeat | Redis TTL 过期 → 告警 |
-| 数据延迟 | 检查最新 kline 时间戳 vs 当前时间 | 超过阈值 → 告警 |
-| 异常仓位 | 对比 target vs actual positions | 偏差过大 → 告警 |
-| 资金变动 | 余额大幅下降检测 | 下降超 5% → 告警 |
-| 策略指标 | 实时 PnL / 回撤 / 仓位比 | 定期报告 |
-
-**告警渠道 (V1):** 日志 + 简易 Webhook (Telegram / DingTalk)。
+| 模块 | 变更类型 | V1 核心变更 |
+|------|---------|------------|
+| Strategy Service | 新增 | 从 `FuturesOrderService` 抽离策略逻辑，引入 `BaseStrategy` 抽象；V1 内置 `BaselineRevStrategy` |
+| Risk Service | 新增 | 风控前置检查：`signal_generated → order_approved / risk_rejected` |
+| Order Service | 重构 | 移除策略逻辑，仅保留差量下单 + 重试 + dry-run |
+| Account Service | 新增 | 统一调用交易所 API (30s 轮询)，缓存到 Redis |
+| Feature Service | 扩展 | 新增日内 ret (1h/2h/4h/8h) + Z-Score 标准化 (shift(1)) |
+| Backtest Engine | 新增 | 离线回测，与实盘共用 `BaseStrategy` 代码 |
+| Monitor Service | 新增 | 心跳检查 + 数据延迟 / 异常仓位 / 资金变动告警 |
 
 #### 8. API Gateway (重构)
 
 **V1 暴露的 REST API:**
 
+
 ```
 GET  /api/v1/health                   — 全局健康状态
 GET  /api/v1/account/balance          — 账户余额
 GET  /api/v1/account/positions        — 当前持仓
-GET  /api/v1/asset-pool               — 资产池列表
-GET  /api/v1/features/{symbol}        — 最新特征
-GET  /api/v1/strategy/status          — 策略运行状态
-POST /api/v1/strategy/rebalance       — 手动触发换仓
-GET  /api/v1/monitor/heartbeats       — 各服务心跳
 ```
 
 ### V1 Redis 事件流 (完整)
@@ -321,144 +201,22 @@ configs/
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### V2 各模块详细设计
+### V2 各模块概要
 
-#### 1. Data Ingestion Service (新增)
+> 各服务的详细设计（接口、配置、代码示例等）参见 `docs/architecture.md`。
+> 策略信号公式详见 `docs/overview/strategy_1.md` 和 `docs/overview/strategy_2.md`。
+> 以下仅列出 V2 阶段的增量变更。
 
-**职责:** 采集交易所逐笔成交数据 (aggTrades), 这是 Dollar Bar 和 Tick 特征的原始输入。
-
-**设计:**
-```
-Binance Futures WebSocket (aggTrade stream)
-    → 内存缓冲 (按 symbol 分桶)
-    → 批量写入 TimescaleDB hypertable: aggTrades_{exchange}
-    → 同时推送到 Redis Stream (供 Dollar Bar Service 实时消费)
-```
-
-**存储 schema:**
-```sql
-CREATE TABLE aggTrades (
-    time         TIMESTAMPTZ NOT NULL,
-    symbol       TEXT NOT NULL,
-    agg_trade_id BIGINT,
-    price        DOUBLE PRECISION,
-    quantity     DOUBLE PRECISION,
-    is_buyer_maker BOOLEAN
-);
-SELECT create_hypertable('aggTrades', 'time');
-```
-
-**关键:** 这是数据量最大的服务。488 symbols × ~7M ticks/month (以 BTC 为例)。需要:
-- 批量写入 (每 1000 条或每 1 秒 flush)
-- TimescaleDB 压缩策略 (7 天后自动压缩)
-- Redis Stream 限制长度 (MAXLEN ~100000), 仅保留最近数据供实时消费
-
-#### 2. Dollar Bar Service (新增)
-
-**职责:** 将逐笔成交聚合为 Dollar Bar, 对应 00_overview Stage 1。
-
-**核心算法:**
-```
-累计 dollar_volume += price × quantity
-当 dollar_volume >= threshold:
-    关闭当前 bar, 输出 23 列
-    重置累计器
-    threshold = auto_K50_ema(近期 bar 的 dollar_volume 中位数)
-```
-
-**输出 23 列 (对应 00_overview):**
-```
-start_time, end_time, open, high, low, close,
-volume, buy_volume, sell_volume, vwap,
-tick_count, dollar_volume, price_std, volume_std,
-up_move_ratio, down_move_ratio, reversals,
-buy_sell_imbalance (OFI), max_trade_volume, max_trade_ratio,
-tick_interval_mean, path_efficiency, impact_density
-```
-
-**事件:** bar 关闭时 emit `dollar_bar_generated`
-
-#### 3. Tick Feature Service (新增)
-
-**职责:** 对应 00_overview Stage 2 — Tick 微观特征 Enrich。
-
-**计算的 9 个特征:**
-
-| 特征名 | 含义 | 计算方式 |
-|--------|------|---------|
-| tick_vpin | 知情交易概率 | Volume-Synchronized PIN |
-| tick_toxicity_run_mean | 毒性连续值均值 | 连续同方向 trade 的 run length 均值 |
-| tick_toxicity_run_max | 毒性连续值最大 | 同上取 max |
-| tick_toxicity_ratio | 毒性 bucket 比例 | 毒性 bucket 占总 bucket 比例 |
-| tick_kyle_lambda | 价格冲击系数 | 回归: ΔP = λ × signed_volume |
-| tick_burstiness | 交易时间聚集度 | 到达间隔的 CV (变异系数) |
-| tick_jump_ratio | 价格跳跃比例 | |ΔP| > threshold 的 tick 占比 |
-| tick_whale_imbalance | 大单买卖不平衡 | 大单 buy_vol - 大单 sell_vol |
-| tick_whale_impact | 大单价格冲击 | 大单前后价格变化均值 |
-
-**窗口:** rolling 50 bars 的 tick window。
-
-**实现方式:** 订阅 `dollar_bar_generated`, 从 Redis Stream/TimescaleDB 读取对应窗口的 raw ticks, 计算特征后附加到 bar 上。
-
-#### 4. Feature Service (V2 扩展)
-
-**在 V1 基础上新增:**
-- 接收 `tick_features_enriched` 事件 (而非仅 `kline_aggregated`)
-- 日频聚合 (00_overview Stage 3): 将 bar 级数据按日聚合
-- 日内多 horizon 收益率 (00_overview Stage 4): ret_1h, ret_2h, ret_4h, ret_8h
-- Z-Score 支持 negate 模式: 反转信号取负
-- 输出融合 tick 特征 + 传统特征的完整特征向量
-
-#### 5. Strategy Service (V2 扩展 — 多策略并行)
-
-**V2 新增策略 (对应 00_overview Top 10):**
-
-| 策略 | 信号构造 | 推荐 NLS |
-|------|---------|----------|
-| rev_x_inv_vpin | zscore_rev_2h × (1 / zscore_vpin) | 10L10S |
-| rev_vpin_filter_t1.0 | zscore_rev_2h, 仅保留 zscore_vpin > 1.0 | 30L30S |
-| rev_vpin_filter_t1.5 | zscore_rev_2h, 仅保留 zscore_vpin > 1.5 | 30L30S |
-| rev_jump_filter_t1.0 | zscore_rev_2h, 仅保留 zscore_jump > 1.0 | 10L10S |
-| rev_jump_filter_t1.5 | zscore_rev_2h, 仅保留 zscore_jump > 1.5 | 30L30S |
-| rev_noise_boost | zscore_rev_2h × (1 + zscore_noise) | 30L30S |
-| regime_switch | 根据 vol 分位切换: 高波做趋势, 低波做反转 | 30L30S |
-| vol_weighted_blend | 多信号按波动率加权融合 | 10L10S |
-| quad_blend | 四因子等权混合 | 30L30S |
-| baseline_rev | zscore_rev_2h + zscore_rev_4h 简单叠加 | 30L30S |
-
-**多策略编排:**
-```yaml
-# strategy_config.yaml (V2)
-strategies:
-  - name: rev_x_inv_vpin
-    weight: 0.3
-    nls: 10L10S
-  - name: rev_vpin_filter_t1.0
-    weight: 0.3
-    nls: 30L30S
-  - name: regime_switch
-    weight: 0.4
-    nls: 30L30S
-
-ensemble_method: weighted_average  # 加权平均目标仓位
-```
-
-#### 6. Risk Service (V2 增强)
-
-**新增规则:**
-
-| 规则 | 说明 |
-|------|------|
-| 波动率自适应仓位 | 高波动环境自动缩减仓位 |
-| 策略间相关性检查 | 当多策略信号高度一致时发出预警 |
-| 动态止损 | 单仓位浮亏超 N 倍 ATR 自动平仓 |
-| 杠杆自适应 | 根据组合波动率调整杠杆 (目标 vol = 15%) |
-
-#### 7. Order Service (V2 增强)
-
-- **Limit Order 支持:** 在流动性好的品种上使用 limit order 降低滑点
-- **TWAP 拆单:** 大单拆分为多笔小单, 按时间均匀执行
-- **智能路由:** 根据 order book depth 选择 market/limit
+| 模块 | 变更类型 | V2 核心变更 |
+|------|---------|------------|
+| Data Ingestion Service | 新增 | aggTrade 采集 → TimescaleDB + Redis Stream |
+| Dollar Bar Service | 新增 | 自适应阈值 (auto_K50_ema) dollar bar，输出 23 列 |
+| Tick Feature Service | 新增 | 9 个微观特征 (VPIN / Kyle's Lambda 等)，rolling 50 bars |
+| Feature Service | 扩展 | 接入 `tick_features_enriched`，融合 tick + 传统特征 |
+| Strategy Service | 扩展 | 10 套策略上线 + ensemble 多策略并行 |
+| Risk Service | 增强 | 波动率自适应仓位、策略相关性检查、动态止损 |
+| Order Service | 增强 | Limit Order + TWAP 拆单 + 智能路由 |
+| Backtest Engine | 增强 | Dollar Bar 回测 + 策略组合回测 |
 
 ### V2 数据流 (完整)
 

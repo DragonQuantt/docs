@@ -2,6 +2,8 @@
 
 Quant Trading 系统命令行接口完整参考。
 
+> **版本说明**: 以下为 V0 已实现的命令。V1/V2 迭代中计划新增 `trading strategy`、`trading risk`、`trading monitor`、`trading account` 等子命令，详见 `docs/architecture.md` 第 3.5 节 CI/CD 流程和 `docs/sprint/back_end_sprint.md`。
+
 ## 全局选项
 
 ```bash
@@ -74,7 +76,11 @@ main run-server --log-level debug
 
 **访问地址**
 
-- WebSocket: `ws://<host>:<port>/ws`
+- WebSocket:
+  - `ws://<host>:<port>/ws/positions`
+  - `ws://<host>:<port>/ws/portfolio`
+  - `ws://<host>:<port>/ws/alerts`
+  - `ws://<host>:<port>/ws/services`
 - 健康检查: `http://<host>:<port>/api/v1/health`
 
 ## 测试客户端
@@ -91,7 +97,7 @@ main ticker-test-client [OPTIONS]
 
 **选项**
 
-- `-u, --uri TEXT` - WebSocket 服务器 URI（默认：ws://localhost:8000/ws）
+- `-u, --uri TEXT` - WebSocket 服务器 URI（默认：ws://localhost:8000/ws/services）
 - `-s, --symbol TEXT` - 交易对符号（默认：BTC/USDT）
 - `-e, --exchange TEXT` - 交易所 ID（默认：binance）
 - `-d, --duration INTEGER` - 运行持续时间（秒，默认：30）
@@ -129,7 +135,7 @@ main ticker-db-client [OPTIONS]
 
 - `-s, --symbol TEXT` - 交易对符号（默认：BTC/USDT）
 - `-e, --exchange TEXT` - 交易所 ID（默认：binance）
-- `-w, --ws-uri TEXT` - WebSocket 服务器 URI（默认：ws://localhost:8000/ws）
+- `-w, --ws-uri TEXT` - WebSocket 服务器 URI（默认：ws://localhost:8000/ws/positions）
 - `-d, --duration INTEGER` - 运行持续时间（秒，默认：无限）
 - `-t, --test` - 从服务器接收模拟数据
 - `-r, --retention INTEGER` - 数据保留策略（天数，默认：30）

@@ -106,9 +106,8 @@ nav:
 - 架构设计:
   - architecture/index.md
   - 架构说明: architecture.md
-- 概述:
-  - 系统概述: overview/00_overview.md
-  - 系统设计 V1/V2: overview/01_system_design_v1_v2.md
+- 策略概述:
+  - 系统设计 V1/V2: overview/index.md
   - 策略 1: overview/strategy_1.md
   - 策略 2: overview/strategy_2.md
 - 前端:
@@ -117,6 +116,7 @@ nav:
 - API 参考:
   - api/index.md
   - CLI 命令: api/cli.md
+  - Redis 事件总线: api/redis.md
   - WebSocket API: api/websocket.md
   - HTTP API: api/http.md
 - 用户指南:

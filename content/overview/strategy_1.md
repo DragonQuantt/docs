@@ -1,141 +1,158 @@
-# Top 10 策略全链路逻辑文档
+# 策略 1: rev_x_inv_vpin — 反转 × 逆 VPIN 连续调制
 
-> 生成时间: 2025-02-14
-> IS/OOS 分割: 2024-01-01 | Fee: 10bps | 数据源: Binance Futures Dollar Bars
-
-## 全局排名总览
-
-| 排名 | 策略 | NLS | Rebal | OOS Sharpe | OOS MDD | OOS Calmar | 实验 |
-|:---:|------|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1 | rev_x_inv_vpin | 10L10S | R1 | +3.33 | -21.1% | 5.35 | T9 |
-| 2 | rev_vpin_filter_t1.0 | 30L30S | R1 | +3.06 | -8.9% | 6.15 | T9 |
-| 3 | rev_vpin_filter_t1.5 | 30L30S | R1 | +3.02 | -11.9% | 4.68 | T9 |
-| 4 | rev_jump_filter_t1.0 | 10L10S | R1 | +2.71 | -15.9% | 5.67 | T9 |
-| 5 | rev_jump_filter_t1.5 | 30L30S | R1 | +2.38 | -12.4% | 3.34 | T9 |
-| 6 | rev_noise_boost | 30L30S | R1 | +2.26 | -12.0% | 3.36 | T9 |
-| 7 | regime_switch | 30L30S | R1 | +2.21 | -16.2% | 2.59 | T9 |
-| 8 | vol_weighted_blend | 10L10S | R1 | +2.20 | -25.8% | 3.26 | T8 |
-| 9 | quad_blend | 30L30S | R1 | +1.99 | -16.8% | 2.42 | T8 |
-| 10 | baseline_rev (2h+4h) | 30L30S | R1 | +1.95 | -15.7% | 2.47 | T8 |
+> 文档更新时间: 2026-03-03
+> 策略定位: Top 1（T9）
+> OOS 指标: Sharpe +3.33 | MDD -21.1% | Calmar 5.35（**回测结果**，实盘可能偏离）
+> 组合配置: 10L10S, R1, same_day, fee=10bps
+> **适用范围**: 本文档以模拟盘/回测为主；实盘上线需单独做风控、滑点与资金管理设计，并先经模拟盘验证。
 
 ---
 
-## 共用数据管线 (所有策略通用)
+## 1. 策略定位
 
-### Stage 0: 原始数据采集
+`rev_x_inv_vpin` 的核心思想是:
 
-```
-Binance Futures REST API
-    → aggTrades (逐笔成交)
-    → 字段: agg_trade_id, price, quantity, first_trade_id, last_trade_id, timestamp_ms, is_buyer_maker
-    → 存储: E:\data\binance_futures\{SYMBOL}\{SYMBOL}-aggTrades-{YYYY-MM}.parquet
-    → 频率: 每月一个文件, BTCUSDT ~7.4M ticks/月
-```
+1. 先用短周期反转构建基础信号（2h + 4h）。
+2. 再用 `tick_vpin_24h` 做连续调制。
+3. 当市场更“噪音主导”（VPIN 低）时放大反转信号。
+4. 当市场更“知情交易主导”（VPIN 高）时压缩反转信号。
 
-### Stage 1: Dollar Bar 聚合
-
-```
-原始 tick → aggregate_bars() [src/crypto_data_engine/services/bar_aggregator/unified.py]
-    → 按累计成交金额 (dollar_volume) 切分, 阈值由 auto_K50_ema 自适应
-    → 每根 bar 产出 23 列:
-      start_time, end_time, open, high, low, close,
-      volume, buy_volume, sell_volume, vwap,
-      tick_count, dollar_volume, price_std, volume_std,
-      up_move_ratio, down_move_ratio, reversals,
-      buy_sell_imbalance (OFI), max_trade_volume, max_trade_ratio,
-      tick_interval_mean, path_efficiency, impact_density
-    → 存储: E:\data\dollar_bar\bars\{SYMBOL}\{SYMBOL}_dollar_bar_auto_K50_ema_{YYYY-MM}.parquet
-    → BTCUSDT ~2000 bars/月
-```
-
-### Stage 2: Tick 微观特征 Enrich
-
-```
-已有 bars + 原始 ticks → TickFeatureEnricher [src/.../tick_feature_enricher.py]
-    → 对每根 bar, 取 rolling 50 bars 的 tick window
-    → 计算 9 个 tick 特征 (tick_ 前缀):
-      tick_vpin              — Volume-Synchronized Probability of Informed Trading
-      tick_toxicity_run_mean — 毒性连续值均值
-      tick_toxicity_run_max  — 毒性连续值最大
-      tick_toxicity_ratio    — 毒性 bucket 比例
-      tick_kyle_lambda       — Kyle's Lambda (价格冲击系数)
-      tick_burstiness        — 交易时间聚集度
-      tick_jump_ratio        — 价格跳跃比例
-      tick_whale_imbalance   — 大单买卖不平衡
-      tick_whale_impact      — 大单价格冲击
-    → 输出 32 列 enriched bars
-    → 存储: E:\data\dollar_bar\bars_enriched\{SYMBOL}\*.parquet
-    → 488 symbols 全量 enriched
-```
-
-### Stage 3: 日频聚合
-
-```
-enriched bars → 按日历天 groupby("date") 聚合:
-    open  = first(open)     high = max(high)      low = min(low)
-    close = last(close)     volume = sum(volume)   dollar_volume = sum(dollar_volume)
-    ofi   = mean(buy_sell_imbalance)               n_bars = count(close)
-    tick_vpin = mean(tick_vpin)                     ... 其余 tick 特征同理取 mean
-    ret   = close.pct_change()                     (日收益率)
-```
-
-### Stage 4: 日内特征提取 (intraday, 用于反转信号)
-
-```
-对每个 symbol, 将 bar 级时间戳转为 nanoseconds:
-    ts = start_time.values.astype("datetime64[ns]").astype("int64")
-
-对每个交易日 date:
-    g_eod = date.value + 23h59m (ns)  — 当日 EOD 锚点
-    i1 = searchsorted(ts, g_eod) - 1  — EOD 前最后一根 bar
-
-    对每个 horizon H ∈ {1h, 2h, 4h, 8h}:
-        i2 = searchsorted(ts, ts[i1] - H) - 1  — 往前推 H 时间
-        ret_H = close[i1] / close[i2] - 1       — H 小时收益率
-
-    对 tick 特征:
-        取 [ts[i1] - 24h, ts[i1]] 范围内所有 bars
-        tick_feature_24h = nanmean(tick_feature[window])
-```
-
-### Stage 5: Z-Score 标准化
-
-```
-对每个 symbol 单独做时序 z-score (window=30天):
-    rolling_mean = mean(last 30 days of raw_value)  [shift(1) 避免 look-ahead]
-    rolling_std  = std(last 30 days of raw_value)   [shift(1)]
-    zscore = (raw_value - rolling_mean) / rolling_std
-
-反转信号取负号 (negate=True): zscore = -zscore
-    → 价格跌 (ret<0) → zscore 为正 → 做多信号
-```
-
-### Stage 6: 回测引擎
-
-```
-遍历所有交易日 all_dates:
-
-    1. 计算当日 PnL (用旧权重):
-       pnl = Σ(weight[sym] × ret[sym][date])  对所有持仓
-
-    2. 换仓判断 (每 rebal_days 天):
-       same_day 模式: sig_date = date       — 当日信号, 0h 延迟
-       prev_day 模式: sig_date = date - 1   — 前日信号, 24h 延迟
-
-       sig_day = signal_dict[sig_date]
-       ranked = sort(sig_day, by=value)
-       long  = ranked[-N_long:]   权重 = +1/(N_long+N_short) 每只
-       short = ranked[:N_short]   权重 = -1/(N_long+N_short) 每只
-
-    3. 扣除换手费:
-       turnover = Σ|target_weight - old_weight| 对所有涉及的 symbol
-       pnl -= turnover × FEE(0.001)
-
-    4. 更新 NAV:
-       nav[t] = nav[t-1] × (1 + pnl)
-```
+它和阈值过滤版（例如 `rev_vpin_filter_t1.0`）不同点在于: 调制函数是连续的，不是硬切断。
 
 ---
 
-以下为每个策略的具体信号构造逻辑。
+## 2. 输入数据与特征定义
 
+策略在每个交易日（EOD=23:59 UTC）对每个 symbol 需要以下输入:
+
+- `ret_2h[date][sym]`: `close(EOD) / close(EOD-2h) - 1`
+- `ret_4h[date][sym]`: `close(EOD) / close(EOD-4h) - 1`
+- `tick_vpin_24h[date][sym]`: EOD 前 24 小时内所有 bar 的 `tick_vpin` 均值
+
+标准化约束（必须一致）:
+
+- `window = 30`（时序 z-score）
+- `ret` 因子 `negate=True`，`vpin` 因子 `negate=False`
+
+---
+
+## 3. 信号构造公式
+
+### 3.1 反转基准信号
+
+```text
+z2h = zscore(ret_2h, window=30, negate=True)
+z4h = zscore(ret_4h, window=30, negate=True)
+baseline_rev = mean(valid(z2h, z4h))
+```
+
+### 3.2 VPIN 构建以及标准化
+ 1. 先算每根 bar 的 tick_vpin
+     在 compute_vpin 里把 ticks 按“等成交量桶”切分，计算每个桶的
+     |buy_vol - sell_vol| / (buy_vol + sell_vol)，最后取均值。
+     参考代码:
+```text
+def compute_vpin(
+      quantities: np.ndarray,
+      is_buyer_maker: np.ndarray,
+      n_buckets: int = 50,
+  ) -> float:
+      if len(quantities) < n_buckets * 2:
+          return np.nan
+
+      buy_vol = quantities.copy().astype(float)
+      sell_vol = quantities.copy().astype(float)
+      buy_vol[is_buyer_maker] = 0.0
+      sell_vol[~is_buyer_maker] = 0.0
+
+      total_vol = quantities.sum()
+      if total_vol <= 0:
+          return np.nan
+      bucket_size = total_vol / n_buckets
+
+      cum_vol = np.cumsum(quantities.astype(float))
+      cum_buy = np.cumsum(buy_vol)
+      cum_sell = np.cumsum(sell_vol)
+
+      boundaries = np.arange(1, n_buckets + 1) * bucket_size
+      bucket_idx = np.searchsorted(cum_vol, boundaries, side="right")
+      bucket_idx = np.minimum(bucket_idx, len(quantities) - 1)
+
+      vpin_vals = []
+      prev_cum_buy = 0.0
+      prev_cum_sell = 0.0
+      prev_idx = 0
+      for bi in bucket_idx:
+          if bi <= prev_idx and len(vpin_vals) > 0:
+              continue
+          b_buy = cum_buy[bi] - prev_cum_buy
+          b_sell = cum_sell[bi] - prev_cum_sell
+          b_total = b_buy + b_sell
+          if b_total > 0:
+              vpin_vals.append(abs(b_buy - b_sell) / b_total)
+          prev_cum_buy = cum_buy[bi]
+          prev_cum_sell = cum_sell[bi]
+          prev_idx = bi
+
+      if not vpin_vals:
+          return np.nan
+      return float(np.mean(vpin_vals))
+```
+2. 再算 tick_vpin_24h[date][sym]
+    在每天 EOD（23:59）先找最后一根 bar i1，再找 i1 往前 24h 的起点 i24，对区间 i24:i1+1 的 bar 级 tick_vpin 取
+    nanmean。
+    参考代码:
+```text
+  i1 = np.searchsorted(ts, g_eod, side="right") - 1
+  if i1 < 0 or i1 >= len(cl) or ts[i1] < g_start:
+      continue
+
+  # Tick features: mean over trailing 24h window of bars
+  i24 = np.searchsorted(ts, ts[i1] - H24, side="right") - 1
+  if i24 < 0:
+      i24 = 0
+  win24 = slice(i24, i1 + 1)
+  for tc in tick_cols:
+      if sym in sym_tick_features[tc]:
+          arr = sym_tick_features[tc][sym]
+          vals = arr[win24]
+          v = np.nanmean(vals)
+          if np.isfinite(v):
+              raw_features[f"{tc}_24h"][gd][sym] = v
+```
+3. 最后做 zscore
+    vpin_z = zscore(tick_vpin_24h, window=30, negate=False)。
+
+
+### 3.3 连续调制(信号层产出)
+
+```text
+multiplier = clip(1.0 - 0.3 * vpin_z, 0.3, 1.7)
+signal = baseline_rev * multiplier
+```
+
+解释:
+
+- `vpin_z = +2` -> `multiplier = 0.4` -> 压缩反转 60%
+- `vpin_z = 0` -> `multiplier = 1.0` -> 不调制
+- `vpin_z = -2` -> `multiplier = 1.6` -> 放大反转 60%
+
+---
+
+## 4. 调仓与持仓规则
+
+调仓时点: 每日 `23:59 UTC`（same_day 模式）
+
+组合构建:
+
+1. 计算全部候选 symbol 的 `signal`。
+2. 从大到小排序。
+3. 做多 Top 10（每只 `+5%`）。
+4. 做空 Bottom 10（每只 `-5%`）。
+5. 组合总敞口: 多头 50% + 空头 50% = 100% dollar-neutral。
+
+执行与费用:
+
+- 使用差量下单（target - current）
+- 扣除换手费 `10bps`(回测),也就是说，模拟盘/实盘里需要对手续费和滑点进行监控，合计单次交易不可以大于10bps
+- 对最小下单量/最小名义金额做截断

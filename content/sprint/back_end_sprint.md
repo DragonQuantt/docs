@@ -57,7 +57,7 @@ feature_calculated
 | Sprint 4 | P1 | 1.5 周 | 风控前置与执行可靠性 |
 | Sprint 5 | P2 | 1 周 | 策略接口统一（回测兼容基础） |
 | Sprint 6 | P2 | 1.5 周 | 回测与模拟盘口径对齐 |
-| Sprint 7 | V2 后置 | 2 周 | 高频采集 + Dollar Bar |
+| Sprint 7 | V2 后置 | 2 周 | 双源 Bar 接入 + 统一契约 |
 | Sprint 8 | V2 后置 | 2 周 | Tick 特征 + 多策略并行 |
 
 ---
@@ -186,21 +186,24 @@ feature_calculated
 
 ---
 
-## Sprint 7: 高频采集与 Dollar Bar（V2 后置）
+## Sprint 7: 双源 Bar 接入与统一契约（V2 后置）
 
-> 目标: 在不影响 MVP 主链路的前提下引入高频数据层。
+> 目标: 同时支持 `tick_agg` 与 `direct_kline`，并对下游输出统一 Bar 契约。
 
 ### 后端任务清单
 
 | 任务 | 产出 | 说明 |
 |------|------|------|
-| Data Ingestion | aggTrade 采集 + 批写 | Redis Streams + TimescaleDB |
-| Dollar Bar | 自适应阈值与冷启动 | 产出可消费 bars |
-| 监控扩展 | 吞吐/延迟指标纳入 health pipeline | 高频链路可观测 |
+| Tick 输入链路 | aggTrade 采集 + Dollar Bar | Redis Streams + 自适应阈值 |
+| 直拉 Kline 链路 | DirectKlineService | REST/WS 直拉 kline |
+| Bar 统一适配层 | `bar_normalized` 输出 | 屏蔽上游来源差异 |
+| Shadow 对账 | `bar_source_mismatch` 告警 | 比较 OHLCV 偏差，超阈值告警/降级 |
 
 ### 验收标准
 
-- [ ] 高频链路可持续运行并可恢复
+- [ ] `tick_agg` 与 `direct_kline` 均可独立运行
+- [ ] 下游 Feature/Strategy 在两种模式下无需改代码
+- [ ] `hybrid` 模式可输出偏差告警并支持自动降级
 - [ ] 不回归 MVP 主链路稳定性
 
 ---
@@ -263,4 +266,3 @@ feature_calculated
 1. 任何不满足不变量的版本禁止进入下一里程碑  
 2. V2 变更不得破坏 M1/M2 已通过能力  
 3. 风险规则异常时默认降级为“停止下单，继续观测”
-

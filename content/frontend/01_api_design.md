@@ -545,6 +545,8 @@ GET /api/v1/orders/history?page=1&page_size=50&sort_by=timestamp&sort_order=desc
 
 #### POST /api/v1/system/emergency-stop
 
+> 此端点属于 System 分组（路由文件 `routes/system.py`），放在 Risk 部分仅因功能相关。
+
 全局紧急停机。触发后立即阻断所有新下单与换仓请求。
 
 **请求体**:
@@ -1076,7 +1078,7 @@ NAV 净值曲线。
 
 **数据来源**: TimescaleDB `strategy_performance` 表
 
-**响应**:
+**响应** (仅为格式示例，指标非真实值):
 
 ```json
 {
