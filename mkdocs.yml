@@ -105,11 +105,11 @@ nav:
   - 配置说明: getting-started/configuration.md
 - 架构设计:
   - architecture/index.md
-  - 架构说明: architecture.md
 - 策略概述:
   - 系统设计 V1/V2: overview/index.md
   - 策略 1: overview/strategy_1.md
   - 策略 2: overview/strategy_2.md
+  - 策略 3: overview/strategy_3.md
 - 前端:
   - 前端概述: frontend/00_overview.md
   - API 设计: frontend/01_api_design.md
