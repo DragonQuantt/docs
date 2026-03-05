@@ -38,6 +38,7 @@ flowchart TD
     subgraph dataPipeline ["数据管线 (Data Pipeline)"]
         direction TB
         subgraph pathA ["输入路径 A: tick 聚合"]
+            TickerData["TickerService"]-->AssetPoolA
             AssetPoolA["AssetPool"] --> DataIngestion["DataIngestion(aggTrade)"]
             DataIngestion --> DollarBar["DollarBar"]
             DollarBar --> TickFeature["TickFeature"]

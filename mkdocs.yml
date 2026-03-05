@@ -123,6 +123,8 @@ nav:
   - guides/index.md
 - 开发指南:
   - development/index.md
+  - ticker_service: development/ticker_service.md
+  - account_service: development/account_service.md
 - 部署运维:
   - deployment/index.md
 - 迭代计划:
