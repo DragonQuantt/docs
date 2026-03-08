@@ -65,7 +65,7 @@ feature_calculated
 ## 4. V1 Sprint 详细计划
 
 > V1 覆盖 strategy_4 (rev_1d): 30L30S, R1, same_day, 1d 反转基准。
-> 数据链路: AssetPool → DirectKline → Feature → Strategy → Risk → Order → Account。
+> 数据链路: AssetPool → DataIngestion → DollarBar → Feature → Strategy → Risk → Order → Account。
 
 ---
 
