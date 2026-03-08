@@ -1,7 +1,7 @@
 # 工业级量化模拟盘 — 架构设计文档
 
 > 编写时间: 2026-03-03
-> 基于: 现有 V0 代码库 + overview/strategy_1.md (Top 10 多因子策略) + overview/strategy_2.md (baseline_rev 2h+4h 反转) + overview/strategy_3.md (ofi_14d 单因子动量)
+> 基于: 现有 V0 代码库 + overview/strategy_1.md (Top 10 多因子策略) + overview/strategy_4.md (rev_1d 1d 反转) + overview/strategy_3.md (ofi_14d 单因子动量)
 > 前置文档: `docs/overview/01_system_design_v1_v2.md`
 
 ---
@@ -29,25 +29,21 @@
 | **故障隔离** | 单服务崩溃不拖垮整个系统 | 独立进程/容器 + Redis 状态缓存 + 自动重启 |
 | **幂等恢复** | 服务重启后能从 Redis 缓存恢复状态 | 每个服务启动时从 Redis 加载最新状态 |
 | **配置驱动** | 所有参数通过 YAML + 环境变量注入 | Pydantic Settings + YAML config |
-| **双输入单输出** | 同时支持 tick 聚合与直拉 kline，但下游只消费统一 Bar 契约 | Source Adapter 归一化 + `bar_normalized` 事件 |
+| **单输入单输出** | tick 聚合为唯一数据源，下游只消费统一 Bar 契约 | Source Adapter 归一化 + `bar_normalized` 事件 |
 
-### 1.2 整体架构图（双输入、单输出契约）
+### 1.2 整体架构图
 
 ```mermaid
 flowchart TD
     subgraph dataPipeline ["数据管线 (Data Pipeline)"]
         direction TB
-        subgraph pathA ["输入路径 A: tick 聚合"]
+        subgraph pathA ["数据采集与 Bar 生成"]
             TickerData["TickerService"]-->AssetPoolA
             AssetPoolA["AssetPool"] --> DataIngestion["DataIngestion(aggTrade)"]
             DataIngestion --> DollarBar["DollarBar"]
             DollarBar --> TickFeature["TickFeature"]
         end
-        subgraph pathB ["输入路径 B: 直拉 kline"]
-            AssetPoolB["AssetPool"] --> DirectKline["DirectKline"]
-        end
         TickFeature --> BarSourceAdapter["BarSourceAdapter(统一 Bar 契约)"]
-        DirectKline --> BarSourceAdapter
         BarSourceAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
         FeatureService -->|feature_calculated| outputData((" "))
     end
@@ -72,16 +68,14 @@ flowchart TD
 
 ### 1.2.1 关键约束
 
-1. 两种输入模式必须产出同一 `Bar` 结构（时间边界、时区、字段语义一致）。
+1. tick 聚合产出统一 `Bar` 结构（时间边界、时区、字段语义一致）。
 2. 下游 `Feature/Strategy/Risk/Order` 不感知数据来源，只消费 `bar_normalized`。
-3. 支持 `tick_agg | direct_kline | hybrid` 三种运行模式。
-4. `hybrid` 模式下必须做 shadow 对账（OHLCV 偏差监控）并支持自动降级。
 
 ### 1.3 策略与执行解耦: BaseStrategy 抽象
 
 **现有问题**: `FuturesOrderService` 将策略逻辑 (`_rank_by_momentum`) 和下单逻辑 (`_open_positions`, `_close_all_positions`) 耦合在同一个类中。无法独立测试策略、无法复用到回测、无法同时运行多策略。
 
-**解耦方案**: 引入 `BaseStrategy` 抽象接口，所有策略（包括 strategy_1 的 Top 10、strategy_2 的 baseline_rev、strategy_3 的 ofi_14d）实现相同接口:
+**解耦方案**: 引入 `BaseStrategy` 抽象接口，所有策略（包括 strategy_1 的 Top 10、strategy_4 的 rev_1d、strategy_3 的 ofi_14d）实现相同接口:
 
 ```python
 class BaseStrategy(ABC):
@@ -122,11 +116,11 @@ class TargetPosition:
     reason: str       # 可读说明
 ```
 
-**strategy_2 (baseline_rev) 实现示例:**
+**strategy_4 (rev_1d) 实现示例:**
 
 ```python
-class BaselineRevStrategy(BaseStrategy):
-    """2h+4h 反转基准策略, 对应 overview/strategy_2.md"""
+class Rev1dStrategy(BaseStrategy):
+    """1d 价格反转策略, 对应 overview/strategy_4.md"""
 
     def __init__(self, long_n: int = 30, short_n: int = 30):
         self.long_n = long_n
@@ -135,14 +129,9 @@ class BaselineRevStrategy(BaseStrategy):
     def generate_signal(self, features, current_positions, timestamp):
         signals = {}
         for symbol, feat in features.items():
-            z2h = feat.get("zscore_neg_ret_2h")
-            z4h = feat.get("zscore_neg_ret_4h")
-            if z2h is not None and z4h is not None:
-                signals[symbol] = (z2h + z4h) / 2
-            elif z2h is not None:
-                signals[symbol] = z2h
-            elif z4h is not None:
-                signals[symbol] = z4h
+            z1d = feat.get("zscore_neg_ret_1d")
+            if z1d is not None:
+                signals[symbol] = z1d
 
         ranked = sorted(signals.items(), key=lambda x: x[1])
         total = self.long_n + self.short_n
@@ -153,23 +142,23 @@ class BaselineRevStrategy(BaseStrategy):
             positions[symbol] = TargetPosition(
                 symbol=symbol, side="long",
                 weight=+weight_per_symbol, signal_value=val,
-                reason="baseline_rev_long"
+                reason="rev_1d_long"
             )
         for symbol, val in ranked[:self.short_n]:
             positions[symbol] = TargetPosition(
                 symbol=symbol, side="short",
                 weight=-weight_per_symbol, signal_value=val,
-                reason="baseline_rev_short"
+                reason="rev_1d_short"
             )
         return TargetPortfolio(
             positions=positions,
-            strategy_name="baseline_rev",
+            strategy_name="rev_1d",
             signal_timestamp=timestamp,
             metadata={"n_candidates": len(signals)},
         )
 ```
 
-**策略汇总表 (strategy_1 / strategy_2 / strategy_3):**
+**策略汇总表 (strategy_1 / strategy_4 / strategy_3):**
 
 所有策略共享相同的 `BaseStrategy` 接口，区别仅在 `generate_signal` 内部的信号构造逻辑、换仓周期和所用资产池:
 
@@ -179,7 +168,7 @@ class BaselineRevStrategy(BaseStrategy):
 | rev_vpin_filter_t1.0 | strategy_1 Top 2/3 | `zscore_neg_ret_2h` 仅保留 `zscore_vpin > 1.0` | ret_2h, tick_vpin | R1 | default |
 | rev_jump_filter_t1.0 | strategy_1 Top 4/5 | `zscore_neg_ret_2h` 仅保留 `zscore_jump > 1.0` | ret_2h, tick_jump_ratio | R1 | default |
 | regime_switch | strategy_1 Top 7 | 高波做趋势, 低波做反转 | ret_2h, volatility | R1 | default |
-| baseline_rev | strategy_2 | `mean(zscore_neg_ret_2h, zscore_neg_ret_4h)` | ret_2h, ret_4h | R1 | default |
+| rev_1d | strategy_4 | `-zscore(ret_1d, window=30)` | ret_1d | R1 | default |
 | ofi_14d | strategy_3 | `zscore(RM_14(ofi_d))` 截面多空 | ofi_d, ofi_14d, dollar_volume_d | R14 | t50_monthly |
 
 ### 1.4 事件流设计 (完整)
@@ -193,12 +182,7 @@ flowchart TD
     DollarBarSvc -->|dollar_bar_generated| TickFeatureSvc["TickFeatureService"]
     TickFeatureSvc -->|tick_features_enriched| BarAdapter["BarSourceAdapter\n(统一 Bar 契约)"]
 
-    AssetPoolUpdated -->|kline 路径| DirectKline["DirectKlineService"]
-    DirectKline -->|kline_raw| BarAdapter
-
     BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
-    BarAdapter -.->|bar_source_mismatch| MonitorAlert["MonitorService"]
-
     FeatureSvc -->|feature_calculated| StrategySvc["StrategyService\n(多策略并行)"]
     StrategySvc -->|signal_generated| RiskSvc["RiskService"]
     RiskSvc -->|order_approved| OrderSvc["OrderService\n(差量下单)"]
@@ -226,17 +210,13 @@ flowchart TD
 1. **事件触发 (主路径)**: 正常运行时通过 Pub/Sub 实时触发
 2. **定时兜底 (备用路径)**: 每个服务维护 cron 定时器，即使错过事件也能按时执行
    - AssetPoolService: 每 24h 更新
-   - StrategyService: 每日 23:59 UTC 触发 (对应 strategy_2 的 same_day 模式)
+   - StrategyService: 每日 23:59 UTC 触发 (对应 strategy_4 的 same_day 模式)
    - OrderService: 兜底检查目标仓位 vs 实际仓位偏差
 
 3. **关键状态持久化到 Redis**:
    - `quant:state:{service_name}:last_run` — 上次执行时间戳
    - `quant:state:{service_name}:status` — running / idle / error
    - 启动时检查 last_run, 若距今超过阈值则立即补执行
-4. **双源对账与自动降级**:
-   - `hybrid` 模式下并行消费 `tick_agg` 与 `direct_kline`
-   - 若 `bar_source_mismatch` 连续超阈值，自动降级到 `direct_kline`
-
 ---
 
 ## 二、目录结构与服务职责 {#directory-structure}
@@ -246,26 +226,21 @@ flowchart TD
 基于现有 `src/quant_trading/` 结构扩展。已有模块保留，新增模块用 `★` 标注。
 
 ```
-quant_trading/
-├── configs/                              # 所有 YAML 配置
-│   ├── aggregator_config.yaml
-│   ├── asset_pool_config.yaml
-│   ├── db_config.yaml
-│   ├── exchange_config.yaml
-│   ├── feature_config.yaml
-│   ├── order_config.yaml
-│   ├── server_config.yaml
+quant_trading_backend/
+├── yamls/                                # YAML 业务配置 (现有)
+│   ├── ticker.yaml                       # TickerService 配置
+│   ├── account.yaml                      # AccountService 配置
+│   ├── exchange.yaml                     # 交易所通用配置
 │   ├── strategy_config.yaml              ★ 策略选择 + 参数
 │   ├── risk_config.yaml                  ★ 风控规则
-│   ├── account_config.yaml               ★ 账户轮询间隔
 │   ├── monitor_config.yaml               ★ 告警阈值 + 渠道
-│   ├── backtest_config.yaml              ★ 回测参数
 │   ├── ingestion_config.yaml             ★ 数据采集配置
 │   └── dollar_bar_config.yaml            ★ Dollar Bar 阈值
 │
 ├── docker/
 │   ├── Dockerfile
-│   └── docker-compose.yml                # 本地开发环境
+│   ├── docker-compose.yml
+│   └── docker-compose.local.yml          # 本地开发
 │
 ├── infra/                                ★ Terraform IaC
 │   ├── main.tf
@@ -286,48 +261,53 @@ quant_trading/
 │   ├── app/
 │   │   ├── cli.py                        # Typer CLI 入口
 │   │   └── commands/
-│   │       ├── trading/
-│   │       │   ├── __init__.py
-│   │       │   ├── account.py
-│   │       │   ├── aggregator.py
-│   │       │   ├── all_services.py
-│   │       │   ├── asset_pool.py
-│   │       │   ├── feature.py
-│   │       │   ├── futures.py
-│   │       │   ├── strategy.py           ★ CLI: trading strategy
-│   │       │   ├── risk.py               ★ CLI: trading risk
-│   │       │   └── monitor.py            ★ CLI: trading monitor
-│   │       ├── backtest/                 ★ CLI: backtest 命令组
-│   │       │   ├── __init__.py
-│   │       │   └── run.py
-│   │       ├── system.py
-│   │       └── ticker.py
+│   │       ├── _utils.py
+│   │       ├── account_service/          # CLI: account-service run
+│   │       ├── ticker_service/           # CLI: ticker-service run
+│   │       ├── configs/                  # CLI: configs list/generate/load
+│   │       ├── strategy_service/         ★ CLI: strategy-service run
+│   │       ├── risk_service/             ★ CLI: risk-service run
+│   │       └── monitor_service/          ★ CLI: monitor-service run
 │   │
 │   ├── common/
 │   │   ├── configs/
-│   │   │   ├── config_settings.py        # Pydantic Settings (扩展)
-│   │   │   └── ...
+│   │   │   ├── paths.py                  # 配置路径管理
+│   │   │   ├── envs/                     # Pydantic 环境配置
+│   │   │   │   ├── base.py
+│   │   │   │   ├── loader.py
+│   │   │   │   └── services/             # account_env, database_env, exchange_env, global_env, redis_env
+│   │   │   └── yamls/                    # YAML 配置加载
+│   │   │       ├── base.py
+│   │   │       ├── loader.py
+│   │   │       └── services/             # account_yaml, exchange_yaml, ticker_yaml
 │   │   ├── redis/
-│   │   │   ├── base_service.py           # BaseEventService (保持)
-│   │   │   ├── channels.py               # 事件通道定义 (扩展)
-│   │   │   ├── client.py
-│   │   │   └── pubsub.py
+│   │   │   ├── base_service.py           # BaseEventService
+│   │   │   ├── channels.py               # Channels, RedisKeys
+│   │   │   ├── client.py                 # RedisClient
+│   │   │   └── pubsub.py                 # RedisPubSub, EventMessage
 │   │   └── utils/
+│   │       ├── config_loader.py
+│   │       └── loggers.py
 │   │
 │   ├── data/
-│   │   ├── db/                           # SQLAlchemy + TimescaleDB
-│   │   └── exchange/                     # CCXT 封装
+│   │   └── db/                           # SQLAlchemy + TimescaleDB
+│   │       ├── database.py               # DatabaseManager
+│   │       ├── models/                   # account_model, symbol_ohlcv_model, tick_model
+│   │       └── repositories/             # base, account, symbol_ohlcv
 │   │
 │   ├── services/
-│   │   ├── asset_pool_service/           # [保持] 资产池
-│   │   │   ├── __init__.py
-│   │   │   ├── asset_pool.py
-│   │   │   └── service.py
+│   │   ├── account_service/              # [现有] 账户状态同步
+│   │   │   └── service.py                # AccountService
 │   │   │
-│   │   ├── aggregator_service/           # [保持] K 线聚合 (time-bar)
-│   │   │   ├── __init__.py
-│   │   │   ├── kline_aggregator.py
-│   │   │   └── service.py
+│   │   ├── ticker_service/               # [现有] 行情数据采集
+│   │   │   └── service.py                # TickerService
+│   │   │
+│   │   ├── feature_service/              # [现有] 特征计算
+│   │   │   ├── feature_calculator.py     # 基础技术指标
+│   │   │   ├── zscore_calculator.py      # Z-Score 标准化
+│   │   │   ├── intraday_features.py      # 日内特征
+│   │   │   └── service.py                # FeatureService
+│   │   │
 │   │   │
 │   │   ├── data_ingestion_service/       ★ [新增] aggTrade 采集
 │   │   │   ├── __init__.py
@@ -346,22 +326,13 @@ quant_trading/
 │   │   │   ├── tick_features.py          # VPIN / Kyle's Lambda 等 9 个
 │   │   │   └── service.py
 │   │   │
-│   │   ├── feature_service/              # [扩展] 特征融合
-│   │   │   ├── __init__.py
-│   │   │   ├── feature_calculator.py     # 基础技术指标 (保持)
-│   │   │   ├── zscore_calculator.py      ★ Z-Score 标准化
-│   │   │   ├── intraday_features.py      ★ 日内 ret (1h/2h/4h/8h)
-│   │   │   ├── daily_aggregator.py       ★ bar → 日级聚合 (ofi_d, dollar_volume_d)
-│   │   │   ├── rolling_features.py       ★ 多日滚动特征 (ofi_14d)
-│   │   │   └── service.py
-│   │   │
 │   │   ├── strategy_service/             ★ [新增] 策略引擎
 │   │   │   ├── __init__.py
 │   │   │   ├── base_strategy.py          # BaseStrategy 抽象
 │   │   │   ├── registry.py               # 策略注册表 (name → class)
 │   │   │   ├── strategies/
 │   │   │   │   ├── __init__.py
-│   │   │   │   ├── baseline_rev.py       # strategy_2: 2h+4h 反转
+│   │   │   │   ├── rev_1d.py             # strategy_4: 1d 反转
 │   │   │   │   ├── rev_x_inv_vpin.py     # strategy_1 Top 1
 │   │   │   │   ├── rev_vpin_filter.py    # strategy_1 Top 2/3
 │   │   │   │   ├── rev_jump_filter.py    # strategy_1 Top 4/5
@@ -370,7 +341,7 @@ quant_trading/
 │   │   │   │   ├── vol_weighted_blend.py # strategy_1 Top 8
 │   │   │   │   ├── quad_blend.py         # strategy_1 Top 9
 │   │   │   │   └── ofi_14d.py            ★ strategy_3: OFI 14d 动量
-│   │   │   ├── ensemble.py              ★ 多策略集成
+│   │   │   ├── ensemble.py               ★ 多策略集成
 │   │   │   └── service.py
 │   │   │
 │   │   ├── risk_service/                 ★ [新增] 风控
@@ -378,15 +349,10 @@ quant_trading/
 │   │   │   ├── risk_rules.py             # 风控规则引擎
 │   │   │   └── service.py
 │   │   │
-│   │   ├── order_service/                # [重构] 纯执行层
+│   │   ├── order_service/                ★ [新增] 纯执行层
 │   │   │   ├── __init__.py
-│   │   │   ├── futures_service.py        # 重构: 移除策略逻辑
-│   │   │   ├── position_differ.py        ★ 目标仓位 vs 当前仓位 差量计算
-│   │   │   └── order_executor.py         ★ 下单 + 重试 + 精度处理
-│   │   │
-│   │   ├── account_service/              ★ [新增] 账户状态
-│   │   │   ├── __init__.py
-│   │   │   └── service.py
+│   │   │   ├── position_differ.py        # 目标仓位 vs 当前仓位 差量计算
+│   │   │   └── order_executor.py         # 下单 + 重试 + 精度处理
 │   │   │
 │   │   ├── monitor_service/              ★ [新增] 监控告警
 │   │   │   ├── __init__.py
@@ -403,33 +369,33 @@ quant_trading/
 │   │       └── report.py                 # 报告生成
 │   │
 │   ├── controller/
-│   │   ├── gateway.py                    # FastAPI 网关
-│   │   └── routes/
-│   │       ├── health.py                 ★ /api/v1/health
-│   │       ├── account.py                ★ /api/v1/account/*
-│   │       ├── strategy.py               ★ /api/v1/strategy/*
-│   │       └── ticker_websocket.py
+│   │   ├── gateway/                      # FastAPI 网关
+│   │   │   ├── base.py                   # ServiceSpec, BaseServiceApp, ServiceApp
+│   │   │   └── specs.py                  # 各服务 App 定义
+│   │   ├── routes/
+│   │   │   └── account.py                # /api/v1/account/* (现有)
+│   │   └── schemas/
+│   │       ├── common.py                 # ApiResponse, PaginationParams
+│   │       └── account.py                # BalanceResponse, PositionItem 等
 │   │
-│   └── domain/                           ★ [新增] 领域模型
-│       ├── __init__.py
-│       ├── events.py                     # 事件 DTO 定义
+│   └── domain/                           # 领域模型
 │       ├── portfolio.py                  # TargetPortfolio / TargetPosition
 │       └── features.py                   # FeatureVector 标准接口
 │
 └── tests/
-    ├── unit/
-    │   ├── test_strategies/              ★ 策略单测
-    │   │   ├── test_baseline_rev.py
-    │   │   ├── test_rev_x_inv_vpin.py
+    ├── conftest.py                       # mock_redis_client 等 fixture
+    ├── services/
+    │   └── test_ticker_service.py
+    ├── common/configs/
+    │   ├── test_yaml_loader.py
+    │   └── test_env_loader.py
+    ├── unit/                             ★ 待补充
+    │   ├── test_strategies/
+    │   │   ├── test_rev_1d.py            ★
     │   │   └── test_ofi_14d.py           ★
-    │   ├── test_risk_rules.py            ★
-    │   ├── test_zscore.py                ★
-    │   ├── test_daily_aggregator.py      ★
-    │   ├── test_backtest_engine.py        ★
-    │   └── ...
-    └── integration/
-        ├── test_event_flow.py            ★ 端到端事件链测试
-        └── test_strategy_backtest.py     ★ 策略回测一致性
+    │   └── test_risk_rules.py            ★
+    └── integration/                      ★ 待补充
+        └── test_event_flow.py            ★
 ```
 
 ### 2.2 各服务详细职责
@@ -489,25 +455,24 @@ def compute_monthly_pool(
 
 | 属性 | 值 |
 |------|-----|
-| **新增文件** | `services/data_ingestion_service/` |
+| **现有参考** | `services/ticker_service/service.py`（TickerService 已采集行情写入 `market:trades`） |
+| **新增文件** | `services/data_ingestion_service/`（从 TickerService 演进，增加 aggTrade 专用采集） |
 | **订阅事件** | `asset_pool_updated` (更新采集 symbol 列表) |
-| **发布** | 写入 Redis Stream `quant:stream:aggTrades:{symbol}` |
+| **发布** | 写入 Redis Stream `market:trades`（与现有 TickerService 保持一致） |
 | **核心逻辑** | 接入 Binance Futures aggTrade WebSocket, 批量写入 TimescaleDB + Redis Stream |
 | **容量** | 488 symbols × ~250 ticks/s (峰值) ≈ 120K ticks/s |
 | **背压控制** | 内存缓冲 + 每 1s 或 1000 条批量 flush |
-| **兼容性** | `tick_agg` / `hybrid` 模式启用 |
 
 #### 2.2.3 Dollar Bar Service (新增)
 
 | 属性 | 值 |
 |------|-----|
 | **新增文件** | `services/dollar_bar_service/` |
-| **订阅** | Redis Stream `quant:stream:aggTrades:{symbol}` |
+| **订阅** | Redis Stream `market:trades` |
 | **发布事件** | `dollar_bar_generated` |
 | **核心逻辑** | 按累计 dollar_volume 切分 bar, 阈值 auto_K50_ema 自适应, 输出 23 列 |
 | **Redis 键** | `quant:dollar_bar:{symbol}` (List, 保留最近 200 bars) |
 | **冷启动** | 预加载最近 7 天 aggTrade 生成种子 bar, 确定初始阈值 |
-| **兼容性** | `tick_agg` / `hybrid` 模式启用 |
 
 #### 2.2.4 Tick Feature Service (新增)
 
@@ -519,32 +484,20 @@ def compute_monthly_pool(
 | **核心逻辑** | 对每根 dollar bar, 取 rolling 50 bars 的 tick window, 计算 9 个微观特征 |
 | **计算特征** | tick_vpin, tick_toxicity_run_mean/max/ratio, tick_kyle_lambda, tick_burstiness, tick_jump_ratio, tick_whale_imbalance/impact |
 | **性能要求** | 使用 NumPy/Polars 向量化, 避免 Python 循环 |
-| **兼容性** | Top 1-7 策略依赖；baseline_rev 可选 |
+| **兼容性** | Top 1-7 策略依赖；rev_1d 不使用 |
 
-#### 2.2.5 Direct Kline Service (基于 Aggregator 扩展)
-
-| 属性 | 值 |
-|------|-----|
-| **现有文件** | `services/aggregator_service/service.py`（扩展） |
-| **订阅事件** | `asset_pool_updated` |
-| **发布事件** | `kline_raw` |
-| **核心逻辑** | 直接从交易所 REST/WS 拉取 kline（1m/5m/1h 等），按统一字段输出 |
-| **降级角色** | 当 tick 链路异常时可作为降级主源 |
-| **兼容性** | `direct_kline` / `hybrid` 模式启用 |
-
-#### 2.2.6 Bar Source Adapter + Feature Service (扩展)
+#### 2.2.5 Feature Service (现有 + 扩展)
 
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/feature_service/service.py` |
-| **上游输入** | `tick_features_enriched` 或 `kline_raw` |
-| **适配输出** | `bar_normalized`（统一 Bar 契约，含 source 字段） |
+| **现有订阅** | `kline_aggregated`（当前从 `quant:kline:{symbol}:{timeframe}` 读取 K 线数据） |
+| **目标上游** | `bar_normalized`（V2 统一 Bar 契约，由 BarSourceAdapter 发布） |
 | **发布事件** | `feature_calculated` |
-| **核心逻辑** | 先归一化 Bar（OHLCV/时间边界/时区），再计算 ret/zscore/融合特征；新增日级聚合 + 多日滚动特征 |
-| **部署形态** | `BarSourceAdapter` 可独立进程部署，也可作为 FeatureService 内嵌模块 |
-| **Hybrid 对账** | 双路并行时比较 OHLCV 偏差，超阈值发布 `bar_source_mismatch` |
-| **新增文件** | `bar_source_adapter.py`, `zscore_calculator.py`, `intraday_features.py`, `daily_aggregator.py` ★, `rolling_features.py` ★ |
-| **Redis 键** | `quant:features:latest:{symbol}`（保持）, `quant:features:daily:{symbol}` ★（日级特征缓存） |
+| **现有功能** | 基础技术指标 (SMA/EMA 等)、日内收益率 (intraday_features.py)、截面 Z-Score (zscore_calculator.py) |
+| **扩展功能** | 日级聚合 (daily_aggregator.py ★)、多日滚动特征 (rolling_features.py ★) |
+| **V2 扩展** | BarSourceAdapter 归一化 tick/kline 为统一 Bar → FeatureService 消费 `bar_normalized` |
+| **Redis 键** | `quant:features:latest:{symbol}`（保持）, `quant:features:{symbol}:{timestamp}`（保持）, `quant:features:daily:{symbol}` ★ |
 
 **日级聚合层 (daily_aggregator.py) — 对应 strategy_3.md Section 2.3/3.2:**
 
@@ -637,8 +590,8 @@ class StrategyRegistry:
         return cls._registry[name](**kwargs)
 
 # 使用:
-@StrategyRegistry.register("baseline_rev")
-class BaselineRevStrategy(BaseStrategy): ...
+@StrategyRegistry.register("rev_1d")
+class Rev1dStrategy(BaseStrategy): ...
 
 @StrategyRegistry.register("rev_x_inv_vpin")
 class RevXInvVpinStrategy(BaseStrategy): ...
@@ -737,7 +690,7 @@ class StrategyService:
 ```yaml
 # 单策略模式
 mode: single
-active_strategy: baseline_rev
+active_strategy: rev_1d
 parameters:
   long_n: 30
   short_n: 30
@@ -752,7 +705,7 @@ parameters:
 #     pool: default
 #     rebalance_days: 1
 #     parameters: { long_n: 10, short_n: 10 }
-#   - name: baseline_rev
+#   - name: rev_1d
 #     weight: 0.3
 #     pool: default
 #     rebalance_days: 1
@@ -852,7 +805,7 @@ Monitor Service 每 30s 扫描:
 | **核心原则** | 与实盘共用 BaseStrategy 代码, 策略无需感知回测 vs 实盘 |
 | **数据输入** | 从 Parquet / CSV / Redis 加载历史 kline 或 dollar bar |
 | **输出指标** | Sharpe, MDD, Calmar, 年化收益率, 换手率, NAV 曲线 |
-| **CLI** | `main backtest run --strategy baseline_rev --start 2024-01-01 --end 2025-01-01` |
+| **CLI** | `main backtest run --strategy rev_1d --start 2024-01-01 --end 2025-01-01` |
 
 **回测核心循环 (对应 overview/strategy_1.md Stage 6):**
 
@@ -879,11 +832,11 @@ for date in all_trading_dates:
 
 | 通道 | 发布者 | 订阅者 |
 |------|-------|-------|
-| `quant:dollar_bar_generated` | DollarBarService | TickFeatureService |
-| `quant:tick_features_enriched` | TickFeatureService | BarSourceAdapter |
-| `quant:kline_raw` | DirectKlineService | BarSourceAdapter |
-| `quant:bar_normalized` | BarSourceAdapter | FeatureService |
-| `quant:bar_source_mismatch` | BarSourceAdapter | MonitorService |
+| `quant:kline_aggregated` | AggregatorService | FeatureService |
+| `quant:order_rebalanced` | OrderService | MonitorService |
+| `quant:dollar_bar_generated` | DollarBarService ★ | TickFeatureService ★ |
+| `quant:tick_features_enriched` | TickFeatureService ★ | BarSourceAdapter ★ |
+| `quant:bar_normalized` | BarSourceAdapter ★ | FeatureService |
 | `quant:signal_generated` | StrategyService | RiskService |
 | `quant:order_approved` | RiskService | OrderService |
 | `quant:risk_rejected` | RiskService | MonitorService |
@@ -895,20 +848,27 @@ for date in all_trading_dates:
 
 | 键模式 | 类型 | 用途 |
 |-------|------|------|
-| `quant:stream:aggTrades:{symbol}` | Stream | aggTrade 实时数据 (MAXLEN ~100000) |
+| `market:trades` | Stream | aggTrade / trades 实时数据 (MAXLEN ~100000) |
+| `market:tickers` | Stream | 聚合行情快照 |
+| `market:ohlcv` | Stream | K 线数据 |
 | `quant:dollar_bar:{symbol}` | List | Dollar Bar 缓存 (最近 200 bars) |
-| `quant:kline:raw:{symbol}:{timeframe}` | String (JSON) | 直拉 kline 最新快照 |
 | `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 |
 | `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
 | `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
 | `quant:features:rolling:{symbol}` | String (JSON) | ★ 多日滚动特征缓存 (ofi_14d 等) |
+| `quant:kline:{symbol}:{timeframe}` | String (JSON) | Kline 数据缓存 |
 | `quant:account:balance` | String (JSON) | 账户余额快照 |
 | `quant:account:positions` | String (JSON) | 当前持仓快照 |
 | `quant:account:orders` | String (JSON) | 活跃挂单快照 |
+| `quant:positions` | String (JSON) | 策略当前仓位 |
 | `quant:portfolio:snapshot` | String (JSON) | NAV / PnL / 回撤等组合指标快照 |
 | `quant:signal:latest` | String (JSON) | 最新策略信号 |
 | `quant:heartbeat:{service}` | String (JSON + TTL) | 服务心跳 |
 | `quant:state:{service}:last_run` | String | 上次执行时间戳 |
+| `quant:state:{service}:status` | String | 服务状态 (running / idle / error) |
+| `quant:risk:status` | String | 风控总体状态 |
+| `quant:risk:disabled_symbols` | String | 风控禁止交易的 symbols |
+| `quant:system:emergency_stop` | String | 全局紧急停止开关 |
 
 ---
 ## 三、AWS 部署方案 {#aws-deployment}
@@ -1199,7 +1159,7 @@ flowchart TD
 ```python
 # DataIngestionService: 写入 Redis Stream
 async def write_to_stream(self, symbol: str, trade: dict):
-    stream_key = f"quant:stream:aggTrades:{symbol}"
+    stream_key = "market:trades"
     await self.redis.xadd(
         stream_key,
         trade,
@@ -1209,7 +1169,7 @@ async def write_to_stream(self, symbol: str, trade: dict):
 
 # DollarBarService: 消费者组读取
 async def consume_trades(self, symbol: str):
-    stream_key = f"quant:stream:aggTrades:{symbol}"
+    stream_key = "market:trades"
     group = "dollar_bar_consumers"
     consumer = f"dollar_bar_{symbol}"
 
@@ -1253,17 +1213,16 @@ async def consume_trades(self, symbol: str):
 
 ## 附录 A: 策略兼容性矩阵 {#appendix-a}
 
-本架构同时兼容 strategy_1 (Top 10 多因子)、strategy_2 (baseline_rev) 和 strategy_3 (ofi_14d):
+本架构同时兼容 strategy_4 (rev_1d)、strategy_1 (Top 10 多因子) 和 strategy_3 (ofi_14d):
 
-| 数据/特征需求 | strategy_2 (baseline_rev) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | 提供服务 |
+| 数据/特征需求 | strategy_4 (rev_1d) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | 提供服务 |
 |-------------|:---:|:---:|:---:|------|
 | 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService |
 | 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService (扩展) |
-| 直拉 Kline (1m OHLCV) | ✅ (可选) | ✅ (无 tick 因子策略) | ✅ (可选) | DirectKlineService |
-| Tick 聚合输入 (aggTrade) | ✅ (可选) | ✅ | ✅ (Dollar Bar 来源) | DataIngestionService |
-| Tick 聚合 Bar (Dollar Bar) | ✅ (可选) | ✅ | ✅ (buy_sell_imbalance) | DollarBarService |
+| Tick 聚合输入 (aggTrade) | ✅ | ✅ | ✅ (Dollar Bar 来源) | DataIngestionService |
+| Tick 聚合 Bar (Dollar Bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | DollarBarService |
 | Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | TickFeatureService |
-| 日内 ret (1h/2h/4h/8h) | ✅ (2h, 4h) | ✅ | ❌ | FeatureService |
+| 日内 ret (1d) | ✅ | ✅ | ❌ | FeatureService |
 | 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
 | 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
 | Z-Score 标准化 | ✅ | ✅ | ✅ (截面) | FeatureService |
@@ -1277,9 +1236,9 @@ async def consume_trades(self, symbol: str):
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
-| **V1** (MVP) | strategy_2 (baseline_rev) | AssetPool + DirectKline + Feature + Strategy + Risk + Order |
-| **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d 简化版，用直拉 kline 聚合日级 OFI) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
-| **V2** (双源统一架构) | strategy_1 + strategy_2 + strategy_3 全部 | V1 + DataIngestion + DollarBar + TickFeature + BarSourceAdapter |
+| **V1** (MVP) | strategy_4 (rev_1d) | AssetPool + DataIngestion + DollarBar + Feature + Strategy + Risk + Order |
+| **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
+| **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + TickFeature + BarSourceAdapter + 多策略集成 |
 
 ## 附录 B: Terraform 模块清单 {#appendix-b}
 
@@ -1319,15 +1278,7 @@ pools:
 
 ```yaml
 mode: single                    # single | ensemble
-active_strategy: baseline_rev
-
-# 数据源模式
-bar_source:
-  mode: hybrid                  # tick_agg | direct_kline | hybrid
-  timeframe: 1m
-  compare_enabled: true         # hybrid 下启用双路对账
-  compare_tolerance_bps: 5      # OHLCV 偏差阈值（bps）
-  fallback_on_mismatch: true    # 偏差超阈值时自动降级到 direct_kline
+active_strategy: rev_1d
 
 # 单策略参数
 parameters:
@@ -1346,7 +1297,7 @@ parameters:
 #     parameters:
 #       long_n: 10
 #       short_n: 10
-#   - name: baseline_rev
+#   - name: rev_1d
 #     weight: 0.3
 #     pool: default
 #     rebalance_days: 1
