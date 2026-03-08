@@ -3,7 +3,7 @@
 > 编写时间: 2026-03-03
 > 当前阶段: **模拟盘（dry-run / paper trading）**
 > 契约基线: `../api/http.md`, `../api/websocket.md`, `../api/redis.md`
-> 策略基线: V1 = `../overview/strategy_2.md`（baseline_rev）; V2 = `../overview/strategy_1.md` + `../overview/strategy_3.md`
+> 策略基线: V1 = `../overview/strategy_4.md`（rev_1d）; V2 = `../overview/strategy_1.md` + `../overview/strategy_3.md`
 
 ---
 
@@ -64,7 +64,7 @@ feature_calculated
 
 ## 4. V1 Sprint 详细计划
 
-> V1 覆盖 strategy_2 (baseline_rev): 30L30S, R1, same_day, 2h+4h 反转基准。
+> V1 覆盖 strategy_4 (rev_1d): 30L30S, R1, same_day, 1d 反转基准。
 > 数据链路: AssetPool → DirectKline → Feature → Strategy → Risk → Order → Account。
 
 ---
@@ -77,7 +77,7 @@ feature_calculated
 
 | 任务 | 产出 | 说明 |
 |------|------|------|
-| 策略最小实现 | `BaselineRevStrategy` | 单策略模式，`generate_signal()` 实现 |
+| 策略最小实现 | `Rev1dStrategy` | 单策略模式，`generate_signal()` 实现 |
 | 事件链打通 | Strategy/Risk/Order/Account 服务联通 | 覆盖主路径和拒绝路径 |
 | dry-run 执行 | OrderService dry-run 输出 | 不触发真实下单 |
 | 基础配置 | `strategy_config.yaml`, `risk_config.yaml`, `order_config.yaml` | 最小参数集 |
