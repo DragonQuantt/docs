@@ -110,6 +110,7 @@ nav:
   - 策略 1: overview/strategy_1.md
   - 策略 2: overview/strategy_2.md
   - 策略 3: overview/strategy_3.md
+  - 策略 4: overview/strategy_4.md
 - 前端:
   - 前端概述: frontend/00_overview.md
   - API 设计: frontend/01_api_design.md
