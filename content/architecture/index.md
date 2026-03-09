@@ -37,14 +37,11 @@
 flowchart TD
     subgraph dataPipeline ["数据管线 (Data Pipeline)"]
         direction TB
-        subgraph pathA ["数据采集与 Bar 生成"]
-            TickerData["TickerService"]-->AssetPoolA
-            AssetPoolA["AssetPool"] --> DataIngestion["DataIngestion(aggTrade)"]
-            DataIngestion --> DollarBar["DollarBar"]
-            DollarBar --> TickFeature["TickFeature"]
-        end
-        TickFeature --> BarSourceAdapter["BarSourceAdapter(统一 Bar 契约)"]
-        BarSourceAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
+        TickerSvc["TickerService"] -->|"写入"| RedisStream["Redis Stream\n(market:trades)"]
+        AssetPoolSvc["AssetPoolService"] -->|"写入"| RedisSet["Redis SET\n(quant:asset_pool:*)"]
+        RedisStream -->|"消费者组读取"| BarAdapter["BarSourceAdapter\n(tick→bar聚合 + tick特征 + 统一Bar契约)\n支持 dollar_bar / time_bar"]
+        RedisSet -->|"读取 symbol 列表"| BarAdapter
+        BarAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
         FeatureService -->|feature_calculated| outputData((" "))
     end
 
@@ -68,8 +65,9 @@ flowchart TD
 
 ### 1.2.1 关键约束
 
-1. tick 聚合产出统一 `Bar` 结构（时间边界、时区、字段语义一致）。
-2. 下游 `Feature/Strategy/Risk/Order` 不感知数据来源，只消费 `bar_normalized`。
+1. **TickerService** 和 **AssetPoolService** 只负责往 Redis 写数据，不直接与下游服务通信。
+2. **BarSourceAdapter** 从 Redis Stream 消费 tick 数据，支持 `dollar_bar`（按累计 dollar volume 切分）和 `time_bar`（按固定时间窗口切分）两种聚合模式，同时计算 tick 微观特征，输出统一 `Bar` 契约。
+3. 下游 `Feature/Strategy/Risk/Order` 不感知数据来源和 bar 类型，只消费 `bar_normalized`。
 
 ### 1.3 策略与执行解耦: BaseStrategy 抽象
 
@@ -175,12 +173,12 @@ class Rev1dStrategy(BaseStrategy):
 
 ```mermaid
 flowchart TD
-    AssetPoolUpdated["asset_pool_updated\n(AssetPoolService)"]
+    TickerSvc["TickerService"] -->|"写入 Redis Stream"| RedisStream["market:trades"]
+    AssetPoolSvc["AssetPoolService"] -->|"写入 Redis SET"| RedisSet["quant:asset_pool:*"]
+    AssetPoolSvc -.->|asset_pool_updated| MonitorAlert
 
-    AssetPoolUpdated -->|tick 路径| DataIngestion["DataIngestionService"]
-    DataIngestion -->|"quant:stream:aggTrades"| DollarBarSvc["DollarBarService"]
-    DollarBarSvc -->|dollar_bar_generated| TickFeatureSvc["TickFeatureService"]
-    TickFeatureSvc -->|tick_features_enriched| BarAdapter["BarSourceAdapter\n(统一 Bar 契约)"]
+    RedisStream -->|"消费者组"| BarAdapter["BarSourceAdapter\n(tick→bar + tick特征 + 统一契约)"]
+    RedisSet -->|"读取 symbol 列表"| BarAdapter
 
     BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
     FeatureSvc -->|feature_calculated| StrategySvc["StrategyService\n(多策略并行)"]
@@ -234,8 +232,7 @@ quant_trading_backend/
 │   ├── strategy_config.yaml              ★ 策略选择 + 参数
 │   ├── risk_config.yaml                  ★ 风控规则
 │   ├── monitor_config.yaml               ★ 告警阈值 + 渠道
-│   ├── ingestion_config.yaml             ★ 数据采集配置
-│   └── dollar_bar_config.yaml            ★ Dollar Bar 阈值
+│   └── bar_source_config.yaml            ★ BarSourceAdapter 配置 (bar 类型 + 阈值)
 │
 ├── docker/
 │   ├── Dockerfile
@@ -299,7 +296,7 @@ quant_trading_backend/
 │   │   ├── account_service/              # [现有] 账户状态同步
 │   │   │   └── service.py                # AccountService
 │   │   │
-│   │   ├── ticker_service/               # [现有] 行情数据采集
+│   │   ├── ticker_service/               # [现有] 行情采集，只负责写入 Redis Stream
 │   │   │   └── service.py                # TickerService
 │   │   │
 │   │   ├── feature_service/              # [现有] 特征计算
@@ -309,22 +306,13 @@ quant_trading_backend/
 │   │   │   └── service.py                # FeatureService
 │   │   │
 │   │   │
-│   │   ├── data_ingestion_service/       ★ [新增] aggTrade 采集
+│   │   ├── bar_source_adapter/           ★ [新增] Bar 聚合 + tick 特征 + 统一契约
 │   │   │   ├── __init__.py
-│   │   │   ├── ingestion_worker.py       # WebSocket aggTrade 采集
-│   │   │   ├── stream_writer.py          # 写入 Redis Stream + TimescaleDB
-│   │   │   └── service.py
-│   │   │
-│   │   ├── dollar_bar_service/           ★ [新增] Dollar Bar 聚合
-│   │   │   ├── __init__.py
-│   │   │   ├── dollar_bar_aggregator.py  # 自适应阈值 + 23 列输出
+│   │   │   ├── dollar_bar_aggregator.py  # Dollar Bar 自适应阈值 + 聚合
+│   │   │   ├── time_bar_aggregator.py    # Time Bar 固定窗口聚合
+│   │   │   ├── tick_features.py          # VPIN / Kyle's Lambda 等 9 个微观特征
 │   │   │   ├── threshold_tracker.py      # auto_K50_ema 阈值管理
-│   │   │   └── service.py
-│   │   │
-│   │   ├── tick_feature_service/         ★ [新增] Tick 微观特征
-│   │   │   ├── __init__.py
-│   │   │   ├── tick_features.py          # VPIN / Kyle's Lambda 等 9 个
-│   │   │   └── service.py
+│   │   │   └── service.py               # BarSourceAdapter 主服务 (消费 Redis Stream)
 │   │   │
 │   │   ├── strategy_service/             ★ [新增] 策略引擎
 │   │   │   ├── __init__.py
@@ -405,12 +393,12 @@ quant_trading_backend/
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/asset_pool_service/service.py` |
-| **订阅事件** | 无 (publish-only) |
-| **发布事件** | `asset_pool_updated` |
-| **核心逻辑** | 支持多种 pool profile，按不同指标/周期筛选合约池 |
+| **订阅事件** | 无 |
+| **发布事件** | `asset_pool_updated`（仅供 Monitor 监听，下游 BarSourceAdapter 不订阅此事件，直接读 Redis SET） |
+| **职责** | **只负责筛选资产池并写入 Redis SET**，不与下游服务直接通信 |
+| **核心逻辑** | 支持多种 pool profile，按不同指标/周期筛选合约池，结果写入 Redis SET |
 | **调度** | `default` 池每 24h 更新; `t50_monthly` 池每月 1 日更新 |
 | **Redis 键** | `quant:asset_pool:{exchange}` (Set, default), `quant:asset_pool:{exchange}:t50_monthly` (Set) |
-| **变更** | 新增多池配置、月度流动性池计算逻辑 |
 
 **多池配置 (asset_pool_config.yaml 扩展):**
 
@@ -451,52 +439,79 @@ def compute_monthly_pool(
     return [sym for sym, _ in ranked[:top_k]]
 ```
 
-#### 2.2.2 Data Ingestion Service (新增)
+#### 2.2.2 BarSourceAdapter (新增 — 合并原 DataIngestion + DollarBar + TickFeature)
+
+BarSourceAdapter 是数据管线的核心聚合服务，从 Redis 拉取原始 tick 数据和资产池信息，完成 bar 聚合、tick 微观特征计算和统一 Bar 契约输出。
 
 | 属性 | 值 |
 |------|-----|
-| **现有参考** | `services/ticker_service/service.py`（TickerService 已采集行情写入 `market:trades`） |
-| **新增文件** | `services/data_ingestion_service/`（从 TickerService 演进，增加 aggTrade 专用采集） |
-| **订阅事件** | `asset_pool_updated` (更新采集 symbol 列表) |
-| **发布** | 写入 Redis Stream `market:trades`（与现有 TickerService 保持一致） |
-| **核心逻辑** | 接入 Binance Futures aggTrade WebSocket, 批量写入 TimescaleDB + Redis Stream |
+| **新增文件** | `services/bar_source_adapter/` |
+| **数据输入** | Redis Stream `market:trades`（消费者组读取，由 TickerService 写入）；Redis SET `quant:asset_pool:*`（确定需要聚合的 symbol 列表） |
+| **发布事件** | `bar_normalized` |
+| **Bar 类型** | 支持 `dollar_bar`（按累计 dollar volume 切分，阈值 auto_K50_ema 自适应）和 `time_bar`（按固定时间窗口切分，如 1m/5m/15m），通过配置切换 |
+| **tick 微观特征** | 在每根 bar 内计算 9 个特征：tick_vpin, tick_toxicity_run_mean/max/ratio, tick_kyle_lambda, tick_burstiness, tick_jump_ratio, tick_whale_imbalance/impact |
+| **输出** | 统一 Bar 契约（OHLCV + tick 微观特征 + buy_sell_imbalance 等），下游 FeatureService 无需感知 bar 类型 |
+| **性能要求** | 使用 NumPy/Polars 向量化，避免 Python 循环 |
 | **容量** | 488 symbols × ~250 ticks/s (峰值) ≈ 120K ticks/s |
-| **背压控制** | 内存缓冲 + 每 1s 或 1000 条批量 flush |
+| **冷启动** | dollar_bar 模式：预加载最近 7 天 tick 生成种子 bar，确定初始阈值 |
 
-#### 2.2.3 Dollar Bar Service (新增)
+**消费者组读取示例:**
 
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/dollar_bar_service/` |
-| **订阅** | Redis Stream `market:trades` |
-| **发布事件** | `dollar_bar_generated` |
-| **核心逻辑** | 按累计 dollar_volume 切分 bar, 阈值 auto_K50_ema 自适应, 输出 23 列 |
-| **Redis 键** | `quant:dollar_bar:{symbol}` (List, 保留最近 200 bars) |
-| **冷启动** | 预加载最近 7 天 aggTrade 生成种子 bar, 确定初始阈值 |
+```python
+async def consume_trades(self):
+    stream_key = "market:trades"
+    group = "bar_source_consumers"
+    consumer = f"bar_source_{self.instance_id}"
 
-#### 2.2.4 Tick Feature Service (新增)
+    try:
+        await self.redis.xgroup_create(stream_key, group, id="0", mkstream=True)
+    except Exception:
+        pass
 
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/tick_feature_service/` |
-| **订阅事件** | `dollar_bar_generated` |
-| **发布事件** | `tick_features_enriched` |
-| **核心逻辑** | 对每根 dollar bar, 取 rolling 50 bars 的 tick window, 计算 9 个微观特征 |
-| **计算特征** | tick_vpin, tick_toxicity_run_mean/max/ratio, tick_kyle_lambda, tick_burstiness, tick_jump_ratio, tick_whale_imbalance/impact |
-| **性能要求** | 使用 NumPy/Polars 向量化, 避免 Python 循环 |
-| **兼容性** | Top 1-7 策略依赖；rev_1d 不使用 |
+    while self._running:
+        messages = await self.redis.xreadgroup(
+            group, consumer,
+            streams={stream_key: ">"},
+            count=100,
+            block=1000,
+        )
+        for stream, entries in messages:
+            for msg_id, trade_data in entries:
+                symbol = trade_data["symbol"]
+                if symbol in self._active_symbols:
+                    self._process_trade(symbol, trade_data)
+                await self.redis.xack(stream_key, group, msg_id)
+```
 
-#### 2.2.5 Feature Service (现有 + 扩展)
+**配置 (bar_source_config.yaml):**
+
+```yaml
+bar_type: dollar_bar           # dollar_bar | time_bar
+
+dollar_bar:
+  initial_threshold: 50000     # 初始 dollar volume 阈值 (USD)
+  ema_window: 50               # auto_K50_ema 自适应窗口
+  min_ticks_per_bar: 10        # 最少 tick 数
+
+time_bar:
+  interval: 5m                 # 时间窗口 (1m / 5m / 15m / 1h)
+
+tick_features:
+  rolling_window: 50           # rolling bar 窗口大小
+  enabled: true                # 是否计算 tick 微观特征
+
+output_columns: 23             # 统一输出列数
+```
+
+#### 2.2.3 Feature Service (现有 + 扩展)
 
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/feature_service/service.py` |
-| **现有订阅** | `kline_aggregated`（当前从 `quant:kline:{symbol}:{timeframe}` 读取 K 线数据） |
-| **目标上游** | `bar_normalized`（V2 统一 Bar 契约，由 BarSourceAdapter 发布） |
+| **订阅事件** | `bar_normalized`（由 BarSourceAdapter 发布） |
 | **发布事件** | `feature_calculated` |
 | **现有功能** | 基础技术指标 (SMA/EMA 等)、日内收益率 (intraday_features.py)、截面 Z-Score (zscore_calculator.py) |
 | **扩展功能** | 日级聚合 (daily_aggregator.py ★)、多日滚动特征 (rolling_features.py ★) |
-| **V2 扩展** | BarSourceAdapter 归一化 tick/kline 为统一 Bar → FeatureService 消费 `bar_normalized` |
 | **Redis 键** | `quant:features:latest:{symbol}`（保持）, `quant:features:{symbol}:{timestamp}`（保持）, `quant:features:daily:{symbol}` ★ |
 
 **日级聚合层 (daily_aggregator.py) — 对应 strategy_3.md Section 2.3/3.2:**
@@ -828,31 +843,29 @@ for date in all_trading_dates:
 
 ### 2.3 Redis 通道 / 键扩展清单
 
-**新增 Pub/Sub 通道 (在 `channels.py` 中扩展):**
+**Pub/Sub 通道 (在 `channels.py` 中扩展):**
 
 | 通道 | 发布者 | 订阅者 |
 |------|-------|-------|
-| `quant:kline_aggregated` | AggregatorService | FeatureService |
-| `quant:order_rebalanced` | OrderService | MonitorService |
-| `quant:dollar_bar_generated` | DollarBarService ★ | TickFeatureService ★ |
-| `quant:tick_features_enriched` | TickFeatureService ★ | BarSourceAdapter ★ |
-| `quant:bar_normalized` | BarSourceAdapter ★ | FeatureService |
+| `quant:asset_pool_updated` | AssetPoolService | MonitorService（BarSourceAdapter 不订阅，直接读 Redis SET） |
+| `quant:bar_normalized` | BarSourceAdapter | FeatureService |
+| `quant:feature_calculated` | FeatureService | StrategyService |
 | `quant:signal_generated` | StrategyService | RiskService |
 | `quant:order_approved` | RiskService | OrderService |
 | `quant:risk_rejected` | RiskService | MonitorService |
 | `quant:order_executed` | OrderService | AccountService, MonitorService |
 | `quant:order_failed` | OrderService | MonitorService |
+| `quant:order_rebalanced` | OrderService | MonitorService |
 | `quant:account_updated` | AccountService | RiskService |
 
-**新增 Redis 键:**
+**Redis 键:**
 
 | 键模式 | 类型 | 用途 |
 |-------|------|------|
-| `market:trades` | Stream | aggTrade / trades 实时数据 (MAXLEN ~100000) |
+| `market:trades` | Stream | TickerService 写入 tick 数据，BarSourceAdapter 消费者组读取 (MAXLEN ~100000) |
 | `market:tickers` | Stream | 聚合行情快照 |
 | `market:ohlcv` | Stream | K 线数据 |
-| `quant:dollar_bar:{symbol}` | List | Dollar Bar 缓存 (最近 200 bars) |
-| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 |
+| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 (BarSourceAdapter 输出) |
 | `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
 | `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
 | `quant:features:rolling:{symbol}` | String (JSON) | ★ 多日滚动特征缓存 (ofi_14d 等) |
@@ -898,10 +911,9 @@ for date in all_trading_dates:
 
 | 服务 | CPU | Memory | 实例数 | 说明 |
 |------|-----|--------|--------|------|
-| Asset Pool Service | 256 | 512 MB | 1 | 低频, 每 24h 执行一次 |
-| Data Ingestion Service | 1024 | 2 GB | 1 | 高吞吐, WebSocket 连接池 |
-| Dollar Bar Service | 512 | 1 GB | 1 | 实时计算 |
-| Tick Feature Service | 1024 | 2 GB | 1 | 向量化计算, 内存密集 |
+| Ticker Service | 1024 | 2 GB | 1 | 高吞吐, WebSocket 连接池, 写入 Redis Stream |
+| Asset Pool Service | 256 | 512 MB | 1 | 低频, 每 24h 执行一次, 写入 Redis SET |
+| BarSourceAdapter | 1024 | 2 GB | 1 | 从 Redis Stream 消费 tick, bar 聚合 + tick 特征计算 |
 | Feature Service | 512 | 1 GB | 1 | |
 | Strategy Service | 256 | 512 MB | 1 | 轻量计算 |
 | Risk Service | 256 | 512 MB | 1 | 规则检查 |
@@ -909,13 +921,13 @@ for date in all_trading_dates:
 | Account Service | 256 | 512 MB | 1 | 定时轮询 |
 | Monitor Service | 256 | 512 MB | 1 | 心跳检查 |
 | API Gateway | 512 | 1 GB | 1-2 | 按访问量扩 |
-| **总计** | | | **11-12** | Fargate 按使用计费 |
+| **总计** | | | **10-11** | Fargate 按使用计费 |
 
 **月费估算 (ap-southeast-1):**
 
 ```
 ECS Fargate:
-  11 tasks × 平均 0.5 vCPU × 1 GB × 730h ≈ $35-50/月
+  10 tasks × 平均 0.5 vCPU × 1 GB × 730h ≈ $30-45/月
 
 ElastiCache Redis (cache.t3.small):
   ≈ $25/月
@@ -1007,15 +1019,16 @@ ECS Task Definition 通过 `secrets` 字段引用:
 flowchart LR
     Push["main branch push"] --> GHA["GitHub Actions"]
     GHA --> Build["Build Docker Image\n+ Push to ECR"]
-    Build --> D1["asset-pool-service\n(trading asset-pool)"]
-    Build --> D2["aggregator-service\n(trading aggregator)"]
-    Build --> D3["feature-service\n(trading feature)"]
-    Build --> D4["strategy-service\n(trading strategy)"]
-    Build --> D5["risk-service\n(trading risk)"]
-    Build --> D6["order-service\n(trading futures)"]
-    Build --> D7["account-service\n(trading account --daemon)"]
-    Build --> D8["monitor-service\n(trading monitor)"]
-    Build --> D9["api-gateway\n(system server)"]
+    Build --> D1["ticker-service\n(ticker run)"]
+    Build --> D2["asset-pool-service\n(trading asset-pool)"]
+    Build --> D3["bar-source-adapter\n(bar-source run)"]
+    Build --> D4["feature-service\n(trading feature)"]
+    Build --> D5["strategy-service\n(trading strategy)"]
+    Build --> D6["risk-service\n(trading risk)"]
+    Build --> D7["order-service\n(trading futures)"]
+    Build --> D8["account-service\n(trading account --daemon)"]
+    Build --> D9["monitor-service\n(trading monitor)"]
+    Build --> D10["api-gateway\n(system server)"]
 ```
 
 ### 3.6 Terraform 模块结构
@@ -1217,11 +1230,12 @@ async def consume_trades(self, symbol: str):
 
 | 数据/特征需求 | strategy_4 (rev_1d) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | 提供服务 |
 |-------------|:---:|:---:|:---:|------|
-| 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService |
-| 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService (扩展) |
-| Tick 聚合输入 (aggTrade) | ✅ | ✅ | ✅ (Dollar Bar 来源) | DataIngestionService |
-| Tick 聚合 Bar (Dollar Bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | DollarBarService |
-| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | TickFeatureService |
+| 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService → Redis SET |
+| 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService → Redis SET |
+| Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | TickerService → Redis Stream |
+| Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | BarSourceAdapter |
+| Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | BarSourceAdapter |
+| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | BarSourceAdapter |
 | 日内 ret (1d) | ✅ | ✅ | ❌ | FeatureService |
 | 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
 | 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
@@ -1236,9 +1250,9 @@ async def consume_trades(self, symbol: str):
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
-| **V1** (MVP) | strategy_4 (rev_1d) | AssetPool + DataIngestion + DollarBar + Feature + Strategy + Risk + Order |
+| **V1** (MVP) | strategy_4 (rev_1d) | Ticker + AssetPool + BarSourceAdapter + Feature + Strategy + Risk + Order |
 | **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
-| **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + TickFeature + BarSourceAdapter + 多策略集成 |
+| **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapter tick 特征启用 + 多策略集成 |
 
 ## 附录 B: Terraform 模块清单 {#appendix-b}
 
@@ -1246,7 +1260,7 @@ async def consume_trades(self, symbol: str):
 |------|------|---------|
 | `vpc` | VPC, 3 Subnet (Public/Private/Data), NAT Gateway, IGW, Route Tables | CIDR: 10.0.0.0/16 |
 | `ecr` | ECR Repository | 镜像保留策略: 最近 10 个 |
-| `ecs` | ECS Cluster, 11 个 Task Definition + Service, Auto Scaling | 见 3.2 资源表 |
+| `ecs` | ECS Cluster, 10 个 Task Definition + Service, Auto Scaling | 见 3.2 资源表 |
 | `redis` | ElastiCache Redis (cache.t3.small, 单节点) | Port 6379, maxmemory-policy: allkeys-lru |
 | `rds` | RDS PostgreSQL 16 (db.t3.small) + TimescaleDB 扩展 | Port 5432, 20GB GP3 |
 | `secrets` | Secrets Manager × 4 (API Key, Private Key, DB Password, Telegram Token) | 自动轮转: 关闭 |
@@ -1272,6 +1286,29 @@ pools:
     lag: 1                        # 使用上月数据
     update_interval: monthly
     min_history_days: 60          # 历史不足 60 天排除
+```
+
+### bar_source_config.yaml
+
+```yaml
+bar_type: dollar_bar             # dollar_bar | time_bar
+
+dollar_bar:
+  initial_threshold: 50000       # 初始 dollar volume 阈值 (USD)
+  ema_window: 50                 # auto_K50_ema 自适应窗口
+  min_ticks_per_bar: 10          # 最少 tick 数
+
+time_bar:
+  interval: 5m                   # 时间窗口 (1m / 5m / 15m / 1h)
+
+tick_features:
+  rolling_window: 50             # rolling bar 窗口大小
+  enabled: true                  # 是否计算 tick 微观特征
+
+consumer_group: bar_source_consumers
+stream_key: market:trades
+batch_size: 100                  # 每次从 Stream 读取的最大消息数
+block_ms: 1000                   # 阻塞等待时间 (毫秒)
 ```
 
 ### strategy_config.yaml
