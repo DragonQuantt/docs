@@ -39,7 +39,7 @@ flowchart TD
         direction TB
         TickerSvc["TickerService"] -->|"写入"| RedisStream["Redis Stream\n(market:trades)"]
         AssetPoolSvc["AssetPoolService"] -->|"写入"| RedisSet["Redis SET\n(quant:asset_pool:*)"]
-        RedisStream -->|"消费者组读取"| BarAdapter["BarSourceAdapter\n(tick→bar聚合 + tick特征 + 统一Bar契约)\n支持 dollar_bar / time_bar"]
+        RedisStream -->|"消费者组读取"| BarAdapter["BarSourceAdapterService\n(tick→bar聚合 + tick特征 + 统一Bar契约)\n支持 dollar_bar / time_bar"]
         RedisSet -->|"读取 symbol 列表"| BarAdapter
         BarAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
         FeatureService -->|feature_calculated| outputData((" "))
@@ -66,7 +66,7 @@ flowchart TD
 ### 1.2.1 关键约束
 
 1. **TickerService** 和 **AssetPoolService** 只负责往 Redis 写数据，不直接与下游服务通信。
-2. **BarSourceAdapter** 从 Redis Stream 消费 tick 数据，支持 `dollar_bar`（按累计 dollar volume 切分）和 `time_bar`（按固定时间窗口切分）两种聚合模式，同时计算 tick 微观特征，输出统一 `Bar` 契约。
+2. **BarSourceAdapterService** 从 Redis Stream 消费 tick 数据，支持 `dollar_bar`（按累计 dollar volume 切分）和 `time_bar`（按固定时间窗口切分）两种聚合模式，同时计算 tick 微观特征，输出统一 `Bar` 契约。
 3. 下游 `Feature/Strategy/Risk/Order` 不感知数据来源和 bar 类型，只消费 `bar_normalized`。
 
 ### 1.3 策略与执行解耦: BaseStrategy 抽象
@@ -177,7 +177,7 @@ flowchart TD
     AssetPoolSvc["AssetPoolService"] -->|"写入 Redis SET"| RedisSet["quant:asset_pool:*"]
     AssetPoolSvc -.->|asset_pool_updated| MonitorAlert
 
-    RedisStream -->|"消费者组"| BarAdapter["BarSourceAdapter\n(tick→bar + tick特征 + 统一契约)"]
+    RedisStream -->|"消费者组"| BarAdapter["BarSourceAdapterService\n(tick→bar + tick特征 + 统一契约)"]
     RedisSet -->|"读取 symbol 列表"| BarAdapter
 
     BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
@@ -232,7 +232,7 @@ quant_trading_backend/
 │   ├── strategy_config.yaml              ★ 策略选择 + 参数
 │   ├── risk_config.yaml                  ★ 风控规则
 │   ├── monitor_config.yaml               ★ 告警阈值 + 渠道
-│   └── bar_source_config.yaml            ★ BarSourceAdapter 配置 (bar 类型 + 阈值)
+│   └── bar_source_config.yaml            ★ BarSourceAdapterService 配置 (bar 类型 + 阈值)
 │
 ├── docker/
 │   ├── Dockerfile
@@ -306,13 +306,13 @@ quant_trading_backend/
 │   │   │   └── service.py                # FeatureService
 │   │   │
 │   │   │
-│   │   ├── bar_source_adapter/           ★ [新增] Bar 聚合 + tick 特征 + 统一契约
+│   │   ├── bar_source_adapter_service/   ★ [新增] Bar 聚合 + tick 特征 + 统一契约
 │   │   │   ├── __init__.py
 │   │   │   ├── dollar_bar_aggregator.py  # Dollar Bar 自适应阈值 + 聚合
 │   │   │   ├── time_bar_aggregator.py    # Time Bar 固定窗口聚合
 │   │   │   ├── tick_features.py          # VPIN / Kyle's Lambda 等 9 个微观特征
 │   │   │   ├── threshold_tracker.py      # auto_K50_ema 阈值管理
-│   │   │   └── service.py               # BarSourceAdapter 主服务 (消费 Redis Stream)
+│   │   │   └── service.py               # BarSourceAdapterService 主服务 (消费 Redis Stream)
 │   │   │
 │   │   ├── strategy_service/             ★ [新增] 策略引擎
 │   │   │   ├── __init__.py
@@ -394,7 +394,7 @@ quant_trading_backend/
 |------|-----|
 | **现有文件** | `services/asset_pool_service/service.py` |
 | **订阅事件** | 无 |
-| **发布事件** | `asset_pool_updated`（仅供 Monitor 监听，下游 BarSourceAdapter 不订阅此事件，直接读 Redis SET） |
+| **发布事件** | `asset_pool_updated`（仅供 Monitor 监听，下游 BarSourceAdapterService 不订阅此事件，直接读 Redis SET） |
 | **职责** | **只负责筛选资产池并写入 Redis SET**，不与下游服务直接通信 |
 | **核心逻辑** | 支持多种 pool profile，按不同指标/周期筛选合约池，结果写入 Redis SET |
 | **调度** | `default` 池每 24h 更新; `t50_monthly` 池每月 1 日更新 |
@@ -439,13 +439,13 @@ def compute_monthly_pool(
     return [sym for sym, _ in ranked[:top_k]]
 ```
 
-#### 2.2.2 BarSourceAdapter (新增 — 合并原 DataIngestion + DollarBar + TickFeature)
+#### 2.2.2 BarSourceAdapterService (新增 — 合并原 DataIngestion + DollarBar + TickFeature)
 
-BarSourceAdapter 是数据管线的核心聚合服务，从 Redis 拉取原始 tick 数据和资产池信息，完成 bar 聚合、tick 微观特征计算和统一 Bar 契约输出。
+BarSourceAdapterService 是数据管线的核心聚合服务，从 Redis 拉取原始 tick 数据和资产池信息，完成 bar 聚合、tick 微观特征计算和统一 Bar 契约输出。
 
 | 属性 | 值 |
 |------|-----|
-| **新增文件** | `services/bar_source_adapter/` |
+| **新增文件** | `services/bar_source_adapter_service/` |
 | **数据输入** | Redis Stream `market:trades`（消费者组读取，由 TickerService 写入）；Redis SET `quant:asset_pool:*`（确定需要聚合的 symbol 列表） |
 | **发布事件** | `bar_normalized` |
 | **Bar 类型** | 支持 `dollar_bar`（按累计 dollar volume 切分，阈值 auto_K50_ema 自适应）和 `time_bar`（按固定时间窗口切分，如 1m/5m/15m），通过配置切换 |
@@ -508,7 +508,7 @@ output_columns: 23             # 统一输出列数
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/feature_service/service.py` |
-| **订阅事件** | `bar_normalized`（由 BarSourceAdapter 发布） |
+| **订阅事件** | `bar_normalized`（由 BarSourceAdapterService 发布） |
 | **发布事件** | `feature_calculated` |
 | **现有功能** | 基础技术指标 (SMA/EMA 等)、日内收益率 (intraday_features.py)、截面 Z-Score (zscore_calculator.py) |
 | **扩展功能** | 日级聚合 (daily_aggregator.py ★)、多日滚动特征 (rolling_features.py ★) |
@@ -847,8 +847,8 @@ for date in all_trading_dates:
 
 | 通道 | 发布者 | 订阅者 |
 |------|-------|-------|
-| `quant:asset_pool_updated` | AssetPoolService | MonitorService（BarSourceAdapter 不订阅，直接读 Redis SET） |
-| `quant:bar_normalized` | BarSourceAdapter | FeatureService |
+| `quant:asset_pool_updated` | AssetPoolService | MonitorService（BarSourceAdapterService 不订阅，直接读 Redis SET） |
+| `quant:bar_normalized` | BarSourceAdapterService | FeatureService |
 | `quant:feature_calculated` | FeatureService | StrategyService |
 | `quant:signal_generated` | StrategyService | RiskService |
 | `quant:order_approved` | RiskService | OrderService |
@@ -862,10 +862,10 @@ for date in all_trading_dates:
 
 | 键模式 | 类型 | 用途 |
 |-------|------|------|
-| `market:trades` | Stream | TickerService 写入 tick 数据，BarSourceAdapter 消费者组读取 (MAXLEN ~100000) |
+| `market:trades` | Stream | TickerService 写入 tick 数据，BarSourceAdapterService 消费者组读取 (MAXLEN ~100000) |
 | `market:tickers` | Stream | 聚合行情快照 |
 | `market:ohlcv` | Stream | K 线数据 |
-| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 (BarSourceAdapter 输出) |
+| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 (BarSourceAdapterService 输出) |
 | `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
 | `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
 | `quant:features:rolling:{symbol}` | String (JSON) | ★ 多日滚动特征缓存 (ofi_14d 等) |
@@ -913,7 +913,7 @@ for date in all_trading_dates:
 |------|-----|--------|--------|------|
 | Ticker Service | 1024 | 2 GB | 1 | 高吞吐, WebSocket 连接池, 写入 Redis Stream |
 | Asset Pool Service | 256 | 512 MB | 1 | 低频, 每 24h 执行一次, 写入 Redis SET |
-| BarSourceAdapter | 1024 | 2 GB | 1 | 从 Redis Stream 消费 tick, bar 聚合 + tick 特征计算 |
+| BarSourceAdapterService | 1024 | 2 GB | 1 | 从 Redis Stream 消费 tick, bar 聚合 + tick 特征计算 |
 | Feature Service | 512 | 1 GB | 1 | |
 | Strategy Service | 256 | 512 MB | 1 | 轻量计算 |
 | Risk Service | 256 | 512 MB | 1 | 规则检查 |
@@ -1233,9 +1233,9 @@ async def consume_trades(self, symbol: str):
 | 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService → Redis SET |
 | 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService → Redis SET |
 | Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | TickerService → Redis Stream |
-| Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | BarSourceAdapter |
-| Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | BarSourceAdapter |
-| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | BarSourceAdapter |
+| Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | BarSourceAdapterService |
+| Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | BarSourceAdapterService |
+| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | BarSourceAdapterService |
 | 日内 ret (1d) | ✅ | ✅ | ❌ | FeatureService |
 | 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
 | 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
@@ -1250,9 +1250,9 @@ async def consume_trades(self, symbol: str):
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
-| **V1** (MVP) | strategy_4 (rev_1d) | Ticker + AssetPool + BarSourceAdapter + Feature + Strategy + Risk + Order |
+| **V1** (MVP) | strategy_4 (rev_1d) | Ticker + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order |
 | **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
-| **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapter tick 特征启用 + 多策略集成 |
+| **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapterService tick 特征启用 + 多策略集成 |
 
 ## 附录 B: Terraform 模块清单 {#appendix-b}
 

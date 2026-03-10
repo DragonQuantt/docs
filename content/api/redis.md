@@ -10,7 +10,7 @@
 | 版本 | 覆盖策略 | 数据链路 |
 |------|---------|---------|
 | **V1 (MVP)** | strategy_2 (baseline_rev) | AssetPool → DirectKline → Feature → Strategy → Risk → Order → Account |
-| **V2** | + strategy_1 (Top 10 多因子) + strategy_3 (ofi_14d) | 新增 DataIngestion → DollarBar → TickFeature → BarSourceAdapter；多策略并行 |
+| **V2** | + strategy_1 (Top 10 多因子) + strategy_3 (ofi_14d) | 新增 DataIngestion → DollarBar → TickFeature → BarSourceAdapterService；多策略并行 |
 
 ---
 
@@ -611,7 +611,7 @@ flowchart TD
     subgraph tickPath ["Tick 聚合路径 (V2)"]
         DataIngestion["DataIngestionService"] -->|"Redis Stream"| DollarBar["DollarBarService"]
         DollarBar -->|dollar_bar_generated| TickFeature["TickFeatureService"]
-        TickFeature -->|tick_features_enriched| BarAdapter["BarSourceAdapter"]
+        TickFeature -->|tick_features_enriched| BarAdapter["BarSourceAdapterService"]
     end
 
     subgraph klinePath ["直拉 Kline 路径"]
@@ -626,10 +626,10 @@ flowchart TD
 | 新增通道 | 发布者 | 订阅者 | 频率 |
 |---------|--------|--------|------|
 | `quant:dollar_bar_generated` | DollarBarService | TickFeatureService | 每根 Dollar Bar |
-| `quant:tick_features_enriched` | TickFeatureService | BarSourceAdapter | 每根 Dollar Bar |
-| `quant:kline_raw` | DirectKlineService | BarSourceAdapter | 每根 K 线 |
-| `quant:bar_normalized` | BarSourceAdapter | FeatureService | 归一化后 |
-| `quant:bar_source_mismatch` | BarSourceAdapter | MonitorService | 偏差超阈值时 |
+| `quant:tick_features_enriched` | TickFeatureService | BarSourceAdapterService | 每根 Dollar Bar |
+| `quant:kline_raw` | DirectKlineService | BarSourceAdapterService | 每根 K 线 |
+| `quant:bar_normalized` | BarSourceAdapterService | FeatureService | 归一化后 |
+| `quant:bar_source_mismatch` | BarSourceAdapterService | MonitorService | 偏差超阈值时 |
 
 ---
 
@@ -762,7 +762,7 @@ Tick 微观特征计算完成（9 个特征），strategy_1 所需。
 }
 ```
 
-结构与 V1 `kline_aggregated` 一致，但作为 BarSourceAdapter 的输入而非直接给 FeatureService。
+结构与 V1 `kline_aggregated` 一致，但作为 BarSourceAdapterService 的输入而非直接给 FeatureService。
 
 ---
 
@@ -770,7 +770,7 @@ Tick 微观特征计算完成（9 个特征），strategy_1 所需。
 
 统一 Bar 契约，屏蔽上游来源差异。下游 Feature/Strategy/Risk/Order 不感知数据来源。
 
-**触发条件**: BarSourceAdapter 归一化完成后。
+**触发条件**: BarSourceAdapterService 归一化完成后。
 
 **`data` 载荷**:
 
@@ -815,7 +815,7 @@ Tick 微观特征计算完成（9 个特征），strategy_1 所需。
 
 双源对账偏差告警（仅 `hybrid` 模式触发）。
 
-**触发条件**: BarSourceAdapter 比较 tick_agg 与 direct_kline 的 OHLCV，偏差超过阈值。
+**触发条件**: BarSourceAdapterService 比较 tick_agg 与 direct_kline 的 OHLCV，偏差超过阈值。
 
 **`data` 载荷**:
 
@@ -892,7 +892,7 @@ Tick 微观特征计算完成（9 个特征），strategy_1 所需。
 | `quant:features:rolling:{symbol}` | String (JSON) | 多日滚动特征缓存 | FeatureService |
 | `quant:dollar_bar:{symbol}` | List | Dollar Bar 缓存 (最近 200 bars) | DollarBarService |
 | `quant:kline:raw:{symbol}:{timeframe}` | String (JSON) | 直拉 kline 最新快照 | DirectKlineService |
-| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 | BarSourceAdapter |
+| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 | BarSourceAdapterService |
 | `quant:stream:aggTrades:{symbol}` | Stream | 高频 tick 数据 | DataIngestionService |
 
 ### V2 键值示例

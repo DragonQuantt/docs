@@ -745,7 +745,7 @@ V2 的 `/ws/services` 新增以下服务：
 | `data_ingestion_service` | 数据采集 | aggTrade WebSocket |
 | `dollar_bar_service` | Dollar Bar 聚合 | 自适应阈值 |
 | `tick_feature_service` | Tick 特征 | 9 个微观特征 |
-| `bar_source_adapter` | Bar 适配层 | 双源归一化 |
+| `bar_source_adapter_service` | Bar 适配层 | 双源归一化 |
 | `monitor_service` | 监控告警 | 心跳检查 + 告警 |
 
 ---

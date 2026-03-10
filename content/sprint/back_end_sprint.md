@@ -295,7 +295,7 @@ feature_calculated
 ## 5. V2 Sprint 详细计划
 
 > V2 新增 strategy_1 (Top 10 多因子) + strategy_3 (ofi_14d 单因子动量)。
-> 数据链路扩展: DataIngestion → DollarBar → TickFeature → BarSourceAdapter → FeatureService。
+> 数据链路扩展: DataIngestion → DollarBar → TickFeature → BarSourceAdapterService → FeatureService。
 > 支持多策略并行和 ensemble 模式。
 
 ---
