@@ -18,7 +18,7 @@
 
 ### 1) Redis Pub/Sub（低频业务事件）
 
-- 典型场景：`signal_generated`、`order_approved`、`risk_rejected`。
+- 典型场景：`signal_generated`、`risk_approved`、`risk_rejected`。
 - 语义：`at-most-once`（订阅者不在线时可能丢消息）。
 - 用法：实时触发主流程。
 
@@ -58,7 +58,7 @@
 
 V1 共 11 个通道，覆盖 strategy_2 (baseline_rev) 的完整交易闭环。
 
-> **说明**：`quant:execution_approved` 与 `quant:execution_rejected` 由 ExecutionService 发布，**在 V1 Sprint 4 "风控前置与执行可靠性" 引入**。V1 Sprint 1 最短闭环阶段允许 OrderService 直接订阅 `quant:order_approved`；Sprint 4 后必须经 ExecutionService 接管。
+> **说明**：`quant:execution_approved` 与 `quant:execution_rejected` 由 ExecutionService 发布，**在 V1 Sprint 4 "风控前置与执行可靠性" 引入**。V1 Sprint 1 最短闭环阶段允许 OrderService 直接订阅 `quant:risk_approved`；Sprint 4 后必须经 ExecutionService 接管。
 
 ### 3.1 通道总览
 
@@ -68,7 +68,7 @@ flowchart LR
     Aggregator -->|kline_aggregated| Feature["FeatureService"]
     Feature -->|feature_calculated| Strategy["StrategyService"]
     Strategy -->|signal_generated| Risk["RiskService"]
-    Risk -->|order_approved| Execution["ExecutionService"]
+    Risk -->|risk_approved| Execution["ExecutionService"]
     Risk -.->|risk_rejected| Monitor["MonitorService"]
     Execution -->|execution_approved| Order["OrderService"]
     Execution -.->|execution_rejected| Monitor
@@ -83,7 +83,7 @@ flowchart LR
 | `quant:kline_aggregated` | AggregatorService | FeatureService | 每根 K 线 |
 | `quant:feature_calculated` | FeatureService | StrategyService | 每次特征更新 |
 | `quant:signal_generated` | StrategyService | RiskService | 每次换仓（R1: 每日 23:59 UTC） |
-| `quant:order_approved` | RiskService | ExecutionService (Sprint 4+) / OrderService (Sprint 1-3) | 风控通过时 |
+| `quant:risk_approved` | RiskService | ExecutionService (Sprint 4+) / OrderService (Sprint 1-3) | 风控通过时 |
 | `quant:risk_rejected` | RiskService | MonitorService | 风控拒绝时 |
 | `quant:execution_approved` | ExecutionService | OrderService | 执行质量通过时（Sprint 4+）|
 | `quant:execution_rejected` | ExecutionService | MonitorService | 执行质量拒绝时（Sprint 4+）|
@@ -280,7 +280,7 @@ K 线数据已聚合，可进行特征计算。
 
 ---
 
-### 3.6 `quant:order_approved`
+### 3.6 `quant:risk_approved`
 
 风控通过，允许执行下单。
 
@@ -337,9 +337,9 @@ K 线数据已聚合，可进行特征计算。
 
 ### 3.6.1 `quant:execution_approved` [Sprint 4+]
 
-执行质量网关对 `order_approved` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过后发布此事件，OrderService 消费后执行真实下单。
+执行质量网关对 `risk_approved` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过后发布此事件，OrderService 消费后执行真实下单。
 
-**触发条件**: ExecutionService 对 `quant:order_approved` 中的 `target_portfolio` 展开为 delta orders 后，每一笔都通过三项检查。
+**触发条件**: ExecutionService 对 `quant:risk_approved` 中的 `target_portfolio` 展开为 delta orders 后，每一笔都通过三项检查。
 
 **`data` 载荷**:
 
@@ -373,7 +373,7 @@ K 线数据已聚合，可进行特征计算。
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID（来自 `order_approved`）|
+| `rebalance_id` | string | 是 | 换仓 ID（来自 `risk_approved`）|
 | `strategy_name` | string | 是 | 策略名 |
 | `approved_at` | string (ISO 8601) | 是 | 批准时间 |
 | `execution_check_summary` | object | 是 | 三项检查摘要 |

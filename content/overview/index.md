@@ -50,7 +50,7 @@ flowchart TD
         Aggregator -->|kline_aggregated| Feature["Feature Service\n(+Z-Score +日内 ret)"]
         Feature -->|feature_calculated| Strategy["Strategy Service ★新\n(策略与下单解耦)"]
         Strategy -->|signal_generated| Risk["Risk Service ★新\n(风控检查)"]
-        Risk -->|order_approved| Order["Order Service ★重构\n(纯执行层)"]
+        Risk -->|risk_approved| Order["Order Service ★重构\n(纯执行层)"]
         Order -->|order_executed| Account["Account Service ★新\n(余额/仓位同步)"]
 
         Backtest["Backtest Engine ★新\n(信号回放 + NAV)"]
@@ -67,7 +67,7 @@ flowchart TD
 | 模块 | 变更类型 | V1 核心变更 |
 |------|---------|------------|
 | Strategy Service | 新增 | 从 `FuturesOrderService` 抽离策略逻辑，引入 `BaseStrategy` 抽象；V1 内置 `BaselineRevStrategy` |
-| Risk Service | 新增 | 风控前置检查：`signal_generated → order_approved / risk_rejected` |
+| Risk Service | 新增 | 风控前置检查：`signal_generated → risk_approved / risk_rejected` |
 | Order Service | 重构 | 移除策略逻辑，仅保留差量下单 + 重试 + dry-run |
 | Account Service | 新增 | 统一调用交易所 API (30s 轮询)，缓存到 Redis |
 | Feature Service | 扩展 | 新增日内 ret (1h/2h/4h/8h) + Z-Score 标准化 (shift(1)) |
@@ -92,7 +92,7 @@ flowchart LR
     A["asset_pool_updated"] --> B["kline_aggregated"]
     B --> C["feature_calculated"]
     C --> D["signal_generated ★"]
-    D --> E["order_approved ★"]
+    D --> E["risk_approved ★"]
     D -.-> F["risk_rejected ★"]
     E --> G["order_executed ★"]
     G --> H["account_updated ★"]
@@ -151,7 +151,7 @@ flowchart TD
         TickFeature -->|tick_features_enriched| FeatureV2["Feature Service ★扩展\n(日内 ret + Z-Score + 日级聚合\n+ tick 融合 + ofi_14d)"]
         FeatureV2 -->|feature_calculated| StrategyV2["Strategy Service ★扩展\n(多策略并行: 反转 + ofi_14d)"]
         StrategyV2 -->|signal_generated| RiskV2["Risk Service ★增强\n(动态风控 + 相关性检查)"]
-        RiskV2 -->|order_approved| OrderV2["Order Service ★增强\n(Limit + TWAP)"]
+        RiskV2 -->|risk_approved| OrderV2["Order Service ★增强\n(Limit + TWAP)"]
         OrderV2 -->|order_executed| AccountV2["Account Service\n(+PnL 归因)"]
 
         BacktestV2["Backtest Engine ★增强\n(Dollar Bar + 组合回测)"]
@@ -191,7 +191,7 @@ flowchart TD
     Merge --> Feat["Feature Service\n(日内 ret + 日级聚合 + ofi_14d)"]
     Feat -->|feature_calculated| Strat["Strategy Service\n(多策略并行)"]
     Strat -->|signal_generated| RiskNode["Risk Service"]
-    RiskNode -->|order_approved| OrdNode["Order Service"]
+    RiskNode -->|risk_approved| OrdNode["Order Service"]
     OrdNode -->|order_executed| AccNode["Account Service"]
 ```
 

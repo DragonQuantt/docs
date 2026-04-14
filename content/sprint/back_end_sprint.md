@@ -34,15 +34,15 @@ Data -> Feature -> Strategy -> Risk -> Order(dry-run) -> Account
 
 feature_calculated
   -> signal_generated
-  -> order_approved / risk_rejected
+  -> risk_approved / risk_rejected
   -> order_executed
   -> account_updated
 ```
 
-> **注**：执行质量网关 **ExecutionService**（滑点/深度/预算检查，详见 [architecture §2.2.9](../architecture/index.md)）在 **V1 Sprint 4** 插入到 Risk 与 Order 之间。Sprint 1 最短闭环阶段 OrderService 直接订阅 `order_approved` 以加速打通；Sprint 4 接入 ExecutionService 后，OrderService 改订阅 `execution_approved`，事件链变为：
+> **注**：执行质量网关 **ExecutionService**（滑点/深度/预算检查，详见 [architecture §2.2.9](../architecture/index.md)）在 **V1 Sprint 4** 插入到 Risk 与 Order 之间。Sprint 1 最短闭环阶段 OrderService 直接订阅 `risk_approved` 以加速打通；Sprint 4 接入 ExecutionService 后，OrderService 改订阅 `execution_approved`，事件链变为：
 >
 > ```
-> signal_generated -> order_approved -> execution_approved / execution_rejected -> order_executed
+> signal_generated -> risk_approved -> execution_approved / execution_rejected -> order_executed
 > ```
 
 核心不变量:
@@ -99,7 +99,7 @@ feature_calculated
 | `quant:kline_aggregated` | K 线聚合 → 触发特征计算 |
 | `quant:feature_calculated` | 特征就绪 → 触发策略信号 |
 | `quant:signal_generated` | 信号生成 → 风控审核 |
-| `quant:order_approved` | 风控通过 → 下单执行 |
+| `quant:risk_approved` | 风控通过 → 下单执行 |
 | `quant:risk_rejected` | 风控拒绝 → 告警 |
 | `quant:order_executed` | 订单执行 → 账户更新 |
 | `quant:order_failed` | 订单失败 → 告警 |
@@ -233,7 +233,7 @@ feature_calculated
 
 **Redis 键**: `quant:risk:status`, `quant:risk:disabled_symbols`, `quant:system:emergency_stop`, `quant:orderbook:{symbol}`
 
-**Redis 事件新增**: `quant:execution_approved`、`quant:execution_rejected`（详见 [redis.md §3.6.1 / §3.6.2](../api/redis.md)）；`quant:order_approved` 订阅者从 OrderService 改为 ExecutionService。
+**Redis 事件新增**: `quant:execution_approved`、`quant:execution_rejected`（详见 [redis.md §3.6.1 / §3.6.2](../api/redis.md)）；`quant:risk_approved` 订阅者从 OrderService 改为 ExecutionService。
 
 #### 验收标准
 
@@ -243,7 +243,7 @@ feature_calculated
 - [ ] 14 个 HTTP 端点均可返回正确数据
 - [ ] 异常订单簿（超龄 > 2s 或深度不足）能被 ExecutionService 拦截，不走到 OrderService
 - [ ] `execution_rejected` 事件能被 MonitorService 接收并触发 `WS /ws/alerts` 告警
-- [ ] `quant:order_approved` 消费者从代码层面确认是 ExecutionService，OrderService 不再直接订阅
+- [ ] `quant:risk_approved` 消费者从代码层面确认是 ExecutionService，OrderService 不再直接订阅
 
 ---
 

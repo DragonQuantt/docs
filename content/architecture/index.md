@@ -49,7 +49,7 @@ flowchart TD
     subgraph tradingPipeline ["交易管线 (Trading Pipeline)"]
         direction LR
         StrategyService["Strategy Service"] -->|signal_generated| RiskService["Risk Service"]
-        RiskService -->|order_approved| ExecutionService["Execution Service\n(订单簿/滑点/预算)"]
+        RiskService -->|risk_approved| ExecutionService["Execution Service\n(订单簿/滑点/预算)"]
         ExecutionService -->|execution_approved| OrderService["Order Service\n(纯执行)"]
         RiskService -.->|risk_rejected| AlertPath((" "))
         ExecutionService -.->|execution_rejected| AlertPath
@@ -190,7 +190,7 @@ flowchart TD
     BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
     FeatureSvc -->|feature_calculated| StrategySvc["StrategyService\n(多策略并行)"]
     StrategySvc -->|signal_generated| RiskSvc["RiskService\n(组合级规则)"]
-    RiskSvc -->|order_approved| ExecSvc["ExecutionService\n(订单簿/滑点/预算)"]
+    RiskSvc -->|risk_approved| ExecSvc["ExecutionService\n(订单簿/滑点/预算)"]
     ExecSvc -->|execution_approved| OrderSvc["OrderService\n(差量下单, 纯执行)"]
     RedisOrderbook -->|"按需读取"| ExecSvc
     RiskSvc -.->|risk_rejected| MonitorAlert
@@ -762,8 +762,8 @@ parameters:
 |------|-----|
 | **新增文件** | `services/risk_service/` |
 | **订阅事件** | `signal_generated` |
-| **发布事件** | `order_approved` 或 `risk_rejected` |
-| **核心逻辑** | 对 TargetPortfolio 逐条规则检查, 全部通过才 emit order_approved |
+| **发布事件** | `risk_approved` 或 `risk_rejected` |
+| **核心逻辑** | 对 TargetPortfolio 逐条规则检查, 全部通过才 emit risk_approved |
 
 **风控规则配置 (risk_config.yaml):**
 
@@ -784,7 +784,7 @@ RiskService 只做**组合级**可行性检查（敞口、回撤、余额），�
 | 属性 | 值 |
 |------|-----|
 | **新增文件** | `services/execution_service/` |
-| **订阅事件** | `order_approved`（原本由 OrderService 订阅，现改由 ExecutionService 接手）|
+| **订阅事件** | `risk_approved`（原本由 OrderService 订阅，现改由 ExecutionService 接手）|
 | **发布事件** | `execution_approved` 或 `execution_rejected` |
 | **数据输入** | Redis String `quant:orderbook:{symbol}`（由 DataService 覆盖写入的最新 L2 订单簿快照）+ Redis `quant:account:*`（组合预算状态）|
 | **核心逻辑** | 对 `target_portfolio` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过才 emit `execution_approved`；任一未通过则按 all-or-nothing 语义 emit `execution_rejected` |
@@ -804,9 +804,9 @@ RiskService 只做**组合级**可行性检查（敞口、回撤、余额），�
 
 ```python
 class ExecutionService:
-    """从 order_approved 消费，逐单做质量检查，全部通过才 emit execution_approved。"""
+    """从 risk_approved 消费，逐单做质量检查，全部通过才 emit execution_approved。"""
 
-    async def on_order_approved(self, event: OrderApprovedEvent) -> None:
+    async def on_risk_approved(self, event: RiskApprovedEvent) -> None:
         target_portfolio = event.target_portfolio
         current_positions = await self.account_reader.load_positions()
         deltas = compute_deltas(target_portfolio, current_positions)
@@ -925,7 +925,7 @@ rejection_policy: all_or_nothing     # V1 推荐：任一拒绝则整批拒绝�
 | `quant:orderbook:{symbol}` 不存在或 TTL 超过 `orderbook_max_age_ms` | 整笔订单记为拒绝原因 `stale_or_missing_book`，按 `rejection_policy` 决定后续 |
 | 前 N 档深度不足以吃完订单量 | `estimate_slippage` 返回 `inf`，滑点检查失败 |
 | 单笔订单通过单笔预算但拖累组合预算超限 | budget 检查失败，reject 时注明当前 `portfolio_used_usdt` |
-| ExecutionService 本身崩溃 | 无状态恢复：重启后只消费新的 `order_approved`，旧事件由 BaseEventService 的 last-run 兜底判断是否补执行 |
+| ExecutionService 本身崩溃 | 无状态恢复：重启后只消费新的 `risk_approved`，旧事件由 BaseEventService 的 last-run 兜底判断是否补执行 |
 
 #### 2.2.10 Order Service (重构)
 
@@ -933,7 +933,7 @@ rejection_policy: all_or_nothing     # V1 推荐：任一拒绝则整批拒绝�
 |------|-----|
 | **现有文件** | `services/order_service/futures_service.py` |
 | **变更** | 移除策略逻辑 (`_rank_by_momentum`), 只保留下单执行 |
-| **订阅事件** | `execution_approved`（由 ExecutionService 发布；不再直接订阅 `order_approved`） |
+| **订阅事件** | `execution_approved`（由 ExecutionService 发布；不再直接订阅 `risk_approved`） |
 | **发布事件** | `order_executed` / `order_failed` |
 | **新增** | `position_differ.py` (差量计算), `order_executor.py` (重试 + 精度) |
 | **Dry-run** | 配置 `dry_run: true` 时只记录不实际下单 |
@@ -1021,7 +1021,7 @@ for date in all_trading_dates:
 | `quant:bar_normalized` | BarSourceAdapterService | FeatureService |
 | `quant:feature_calculated` | FeatureService | StrategyService |
 | `quant:signal_generated` | StrategyService | RiskService |
-| `quant:order_approved` | RiskService | ExecutionService |
+| `quant:risk_approved` | RiskService | ExecutionService |
 | `quant:risk_rejected` | RiskService | MonitorService |
 | `quant:execution_approved` | ExecutionService | OrderService |
 | `quant:execution_rejected` | ExecutionService | MonitorService |
@@ -1321,7 +1321,7 @@ flowchart TD
     end
 
     subgraph lowFreq ["低频事件层: Redis Pub/Sub"]
-        Events["asset_pool_updated\nfeature_calculated\nsignal_generated\norder_approved ..."]
+        Events["asset_pool_updated\nfeature_calculated\nsignal_generated\nrisk_approved ..."]
         Events -->|"<10 msg/min\n广播模式"| PubSub["Redis Pub/Sub\n(BaseEventService)"]
     end
 
