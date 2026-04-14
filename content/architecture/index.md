@@ -37,7 +37,8 @@
 flowchart TD
     subgraph dataPipeline ["数据管线 (Data Pipeline)"]
         direction TB
-        TickerSvc["TickerService"] -->|"写入"| RedisStream["Redis Stream\n(market:trades)"]
+        DataSvc["DataService\n(trades + order book)"] -->|"写入 trades"| RedisStream["Redis Stream\n(market:trades)"]
+        DataSvc -->|"写入 order book"| RedisOrderbook["Redis String\n(quant:orderbook:*)"]
         AssetPoolSvc["AssetPoolService"] -->|"写入"| RedisSet["Redis SET\n(quant:asset_pool:*)"]
         RedisStream -->|"消费者组读取"| BarAdapter["BarSourceAdapterService\n(tick→bar聚合 + tick特征 + 统一Bar契约)\n支持 dollar_bar / time_bar"]
         RedisSet -->|"读取 symbol 列表"| BarAdapter
@@ -48,8 +49,10 @@ flowchart TD
     subgraph tradingPipeline ["交易管线 (Trading Pipeline)"]
         direction LR
         StrategyService["Strategy Service"] -->|signal_generated| RiskService["Risk Service"]
-        RiskService -->|order_approved| OrderService["Order Service"]
+        RiskService -->|order_approved| ExecutionService["Execution Service\n(订单簿/滑点/预算)"]
+        ExecutionService -->|execution_approved| OrderService["Order Service\n(纯执行)"]
         RiskService -.->|risk_rejected| AlertPath((" "))
+        ExecutionService -.->|execution_rejected| AlertPath
         OrderService -->|order_executed| AccountService["Account Service"]
     end
 
@@ -61,13 +64,16 @@ flowchart TD
     end
 
     outputData --> StrategyService
+    RedisOrderbook -->|"按需读取"| ExecutionService
 ```
 
 ### 1.2.1 关键约束
 
-1. **TickerService** 和 **AssetPoolService** 只负责往 Redis 写数据，不直接与下游服务通信。
+1. **DataService** 和 **AssetPoolService** 只负责往 Redis 写数据，不直接与下游服务通信。
 2. **BarSourceAdapterService** 从 Redis Stream 消费 tick 数据，支持 `dollar_bar`（按累计 dollar volume 切分）和 `time_bar`（按固定时间窗口切分）两种聚合模式，同时计算 tick 微观特征，输出统一 `Bar` 契约。
-3. 下游 `Feature/Strategy/Risk/Order` 不感知数据来源和 bar 类型，只消费 `bar_normalized`。
+3. 下游 `Feature/Strategy/Risk/Execution/Order` 不感知数据来源和 bar 类型，只消费 `bar_normalized`。
+4. **DataService** 是公共行情流（trades + order book + 未来可能的 ticker / kline）的唯一所有者；**AccountService** 是私有用户数据流（balance / positions / orders）的唯一所有者。两者使用独立的 ccxt.pro 连接和不同的 rate-limit 桶，互不干扰。
+5. **ExecutionService** 是介于 RiskService 与 OrderService 之间的执行质量网关，**不持有任何 WebSocket**，仅从 Redis 读取 DataService 写入的 `quant:orderbook:{symbol}` 做滑点 / 深度 / 预算检查。
 
 ### 1.3 策略与执行解耦: BaseStrategy 抽象
 
@@ -173,7 +179,8 @@ class Rev1dStrategy(BaseStrategy):
 
 ```mermaid
 flowchart TD
-    TickerSvc["TickerService"] -->|"写入 Redis Stream"| RedisStream["market:trades"]
+    DataSvc["DataService\n(trades + order book)"] -->|"写入 Redis Stream"| RedisStream["market:trades"]
+    DataSvc -->|"覆盖写 Redis String"| RedisOrderbook["quant:orderbook:{symbol}"]
     AssetPoolSvc["AssetPoolService"] -->|"写入 Redis SET"| RedisSet["quant:asset_pool:*"]
     AssetPoolSvc -.->|asset_pool_updated| MonitorAlert
 
@@ -182,9 +189,12 @@ flowchart TD
 
     BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
     FeatureSvc -->|feature_calculated| StrategySvc["StrategyService\n(多策略并行)"]
-    StrategySvc -->|signal_generated| RiskSvc["RiskService"]
-    RiskSvc -->|order_approved| OrderSvc["OrderService\n(差量下单)"]
+    StrategySvc -->|signal_generated| RiskSvc["RiskService\n(组合级规则)"]
+    RiskSvc -->|order_approved| ExecSvc["ExecutionService\n(订单簿/滑点/预算)"]
+    ExecSvc -->|execution_approved| OrderSvc["OrderService\n(差量下单, 纯执行)"]
+    RedisOrderbook -->|"按需读取"| ExecSvc
     RiskSvc -.->|risk_rejected| MonitorAlert
+    ExecSvc -.->|execution_rejected| MonitorAlert
     OrderSvc -->|order_executed| AccountSvc["AccountService"]
     OrderSvc -.->|order_failed| MonitorAlert
 ```
@@ -226,7 +236,7 @@ flowchart TD
 ```
 quant_trading_backend/
 ├── yamls/                                # YAML 业务配置 (现有)
-│   ├── ticker.yaml                       # TickerService 配置
+│   ├── data.yaml                         # DataService 配置
 │   ├── account.yaml                      # AccountService 配置
 │   ├── exchange.yaml                     # 交易所通用配置
 │   ├── strategy_config.yaml              ★ 策略选择 + 参数
@@ -260,7 +270,7 @@ quant_trading_backend/
 │   │   └── commands/
 │   │       ├── _utils.py
 │   │       ├── account_service/          # CLI: account-service run
-│   │       ├── ticker_service/           # CLI: ticker-service run
+│   │       ├── data_service/             # CLI: data-service run
 │   │       ├── configs/                  # CLI: configs list/generate/load
 │   │       ├── strategy_service/         ★ CLI: strategy-service run
 │   │       ├── risk_service/             ★ CLI: risk-service run
@@ -276,7 +286,7 @@ quant_trading_backend/
 │   │   │   └── yamls/                    # YAML 配置加载
 │   │   │       ├── base.py
 │   │   │       ├── loader.py
-│   │   │       └── services/             # account_yaml, exchange_yaml, ticker_yaml
+│   │   │       └── services/             # account_yaml, exchange_yaml, data_yaml
 │   │   ├── redis/
 │   │   │   ├── base_service.py           # BaseEventService
 │   │   │   ├── channels.py               # Channels, RedisKeys
@@ -296,8 +306,8 @@ quant_trading_backend/
 │   │   ├── account_service/              # [现有] 账户状态同步
 │   │   │   └── service.py                # AccountService
 │   │   │
-│   │   ├── ticker_service/               # [现有] 行情采集，只负责写入 Redis Stream
-│   │   │   └── service.py                # TickerService
+│   │   ├── data_service/                 # [现有] 市场数据采集（行情+订单簿），只负责写入 Redis Stream
+│   │   │   └── service.py                # DataService
 │   │   │
 │   │   ├── feature_service/              # [现有] 特征计算
 │   │   │   ├── feature_calculator.py     # 基础技术指标
@@ -373,7 +383,7 @@ quant_trading_backend/
 └── tests/
     ├── conftest.py                       # mock_redis_client 等 fixture
     ├── services/
-    │   └── test_ticker_service.py
+    │   └── test_data_service.py
     ├── common/configs/
     │   ├── test_yaml_loader.py
     │   └── test_env_loader.py
@@ -446,7 +456,7 @@ BarSourceAdapterService 是数据管线的核心聚合服务，从 Redis 拉取�
 | 属性 | 值 |
 |------|-----|
 | **新增文件** | `services/bar_source_adapter_service/` |
-| **数据输入** | Redis Stream `market:trades`（消费者组读取，由 TickerService 写入）；Redis SET `quant:asset_pool:*`（确定需要聚合的 symbol 列表） |
+| **数据输入** | Redis Stream `market:trades`（消费者组读取，由 DataService 写入）；Redis SET `quant:asset_pool:*`（确定需要聚合的 symbol 列表） |
 | **发布事件** | `bar_normalized` |
 | **Bar 类型** | 支持 `dollar_bar`（按累计 dollar volume 切分，阈值 auto_K50_ema 自适应）和 `time_bar`（按固定时间窗口切分，如 1m/5m/15m），通过配置切换 |
 | **tick 微观特征** | 在每根 bar 内计算 9 个特征：tick_vpin, tick_toxicity_run_mean/max/ratio, tick_kyle_lambda, tick_burstiness, tick_jump_ratio, tick_whale_imbalance/impact |
@@ -862,9 +872,10 @@ for date in all_trading_dates:
 
 | 键模式 | 类型 | 用途 |
 |-------|------|------|
-| `market:trades` | Stream | TickerService 写入 tick 数据，BarSourceAdapterService 消费者组读取 (MAXLEN ~100000) |
-| `market:tickers` | Stream | 聚合行情快照 |
-| `market:ohlcv` | Stream | K 线数据 |
+| `market:trades` | Stream | DataService 写入 tick 数据，BarSourceAdapterService 消费者组读取 (MAXLEN ~100000) |
+| `market:tickers` | Stream | DataService 写入聚合行情快照 |
+| `market:ohlcv` | Stream | DataService 写入 K 线数据 |
+| `market:orderbook` | Stream | DataService 写入订单簿快照 (bids/asks JSON，深度由 `orderbook_depth_limit` 控制) |
 | `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 (BarSourceAdapterService 输出) |
 | `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
 | `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
@@ -911,7 +922,7 @@ for date in all_trading_dates:
 
 | 服务 | CPU | Memory | 实例数 | 说明 |
 |------|-----|--------|--------|------|
-| Ticker Service | 1024 | 2 GB | 1 | 高吞吐, WebSocket 连接池, 写入 Redis Stream |
+| Data Service | 1024 | 2 GB | 1 | 高吞吐, WebSocket 连接池, 写入 Redis Stream |
 | Asset Pool Service | 256 | 512 MB | 1 | 低频, 每 24h 执行一次, 写入 Redis SET |
 | BarSourceAdapterService | 1024 | 2 GB | 1 | 从 Redis Stream 消费 tick, bar 聚合 + tick 特征计算 |
 | Feature Service | 512 | 1 GB | 1 | |
@@ -1019,7 +1030,7 @@ ECS Task Definition 通过 `secrets` 字段引用:
 flowchart LR
     Push["main branch push"] --> GHA["GitHub Actions"]
     GHA --> Build["Build Docker Image\n+ Push to ECR"]
-    Build --> D1["ticker-service\n(ticker run)"]
+    Build --> D1["data-service\n(data run)"]
     Build --> D2["asset-pool-service\n(trading asset-pool)"]
     Build --> D3["bar-source-adapter\n(bar-source run)"]
     Build --> D4["feature-service\n(trading feature)"]
@@ -1232,7 +1243,7 @@ async def consume_trades(self, symbol: str):
 |-------------|:---:|:---:|:---:|------|
 | 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService → Redis SET |
 | 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService → Redis SET |
-| Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | TickerService → Redis Stream |
+| Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | DataService → Redis Stream |
 | Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | BarSourceAdapterService |
 | Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | BarSourceAdapterService |
 | Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | BarSourceAdapterService |
@@ -1250,7 +1261,7 @@ async def consume_trades(self, symbol: str):
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
-| **V1** (MVP) | strategy_4 (rev_1d) | Ticker + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order |
+| **V1** (MVP) | strategy_4 (rev_1d) | Data + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order |
 | **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
 | **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapterService tick 特征启用 + 多策略集成 |
 
