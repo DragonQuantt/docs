@@ -73,7 +73,7 @@ flowchart TD
 2. **BarSourceAdapterService** 从 Redis Stream 消费 tick 数据，支持 `dollar_bar`（按累计 dollar volume 切分）和 `time_bar`（按固定时间窗口切分）两种聚合模式，同时计算 tick 微观特征，输出统一 `Bar` 契约。
 3. 下游 `Feature/Strategy/Risk/Execution/Order` 不感知数据来源和 bar 类型，只消费 `bar_normalized`。
 4. **DataService** 是公共行情流（trades + order book + 未来可能的 ticker / kline）的唯一所有者；**AccountService** 是私有用户数据流（balance / positions / orders）的唯一所有者。两者使用独立的 ccxt.pro 连接和不同的 rate-limit 桶，互不干扰。
-5. **ExecutionService** 是介于 RiskService 与 OrderService 之间的执行质量网关，**不持有任何 WebSocket**，仅从 Redis 读取 DataService 写入的 `quant:orderbook:{symbol}` 做滑点 / 深度 / 预算检查。
+5. **ExecutionService** 是介于 RiskService 与 OrderService 之间的执行质量网关，**不持有任何 WebSocket**，仅从 Redis 读取 DataService 写入的 `quant:orderbook:{symbol}` 做滑点 / 深度 / 预算检查。详见 §2.2.9。
 
 ### 1.3 策略与执行解耦: BaseStrategy 抽象
 
@@ -241,6 +241,7 @@ quant_trading_backend/
 │   ├── exchange.yaml                     # 交易所通用配置
 │   ├── strategy_config.yaml              ★ 策略选择 + 参数
 │   ├── risk_config.yaml                  ★ 风控规则
+│   ├── execution_config.yaml             ★ 执行质量网关配置 (滑点/深度/预算)
 │   ├── monitor_config.yaml               ★ 告警阈值 + 渠道
 │   └── bar_source_config.yaml            ★ BarSourceAdapterService 配置 (bar 类型 + 阈值)
 │
@@ -274,6 +275,7 @@ quant_trading_backend/
 │   │       ├── configs/                  # CLI: configs list/generate/load
 │   │       ├── strategy_service/         ★ CLI: strategy-service run
 │   │       ├── risk_service/             ★ CLI: risk-service run
+│   │       ├── execution_service/        ★ CLI: execution-service run
 │   │       └── monitor_service/          ★ CLI: monitor-service run
 │   │
 │   ├── common/
@@ -346,6 +348,14 @@ quant_trading_backend/
 │   │   │   ├── __init__.py
 │   │   │   ├── risk_rules.py             # 风控规则引擎
 │   │   │   └── service.py
+│   │   │
+│   │   ├── execution_service/            ★ [新增] 执行质量网关 (滑点/深度/预算)
+│   │   │   ├── __init__.py
+│   │   │   ├── orderbook_reader.py       # 从 Redis 读 quant:orderbook:{symbol}
+│   │   │   ├── slippage_checker.py       # 基于订单簿深度估算滑点
+│   │   │   ├── depth_checker.py          # 深度充足性校验
+│   │   │   ├── budget_checker.py         # 单笔 / 组合预算校验
+│   │   │   └── service.py                # ExecutionService 主服务
 │   │   │
 │   │   ├── order_service/                ★ [新增] 纯执行层
 │   │   │   ├── __init__.py
@@ -767,13 +777,163 @@ max_daily_turnover: 3.0       # 每日最大换手率
 blacklist: []                 # 禁止交易的币种
 ```
 
-#### 2.2.9 Order Service (重构)
+#### 2.2.9 Execution Service (新增 — 执行质量网关)
+
+RiskService 只做**组合级**可行性检查（敞口、回撤、余额），不看订单簿。但当组合方案落到**单笔订单**时，仍可能因为滑点过大、深度不足或预算超限而执行质量糟糕。ExecutionService 是**介于 RiskService 与 OrderService 之间的执行质量网关**，在订单真正下到交易所之前做逐单级兜底。
+
+| 属性 | 值 |
+|------|-----|
+| **新增文件** | `services/execution_service/` |
+| **订阅事件** | `order_approved`（原本由 OrderService 订阅，现改由 ExecutionService 接手）|
+| **发布事件** | `execution_approved` 或 `execution_rejected` |
+| **数据输入** | Redis String `quant:orderbook:{symbol}`（由 DataService 覆盖写入的最新 L2 订单簿快照）+ Redis `quant:account:*`（组合预算状态）|
+| **核心逻辑** | 对 `target_portfolio` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过才 emit `execution_approved`；任一未通过则按 all-or-nothing 语义 emit `execution_rejected` |
+| **关键约束** | **不持有任何 WebSocket**、**不直接调用交易所**，仅读 Redis；ExecutionService 崩溃后可从空状态快速恢复，不依赖任何本地缓存 |
+| **配置文件** | `yamls/execution_config.yaml` |
+| **与 RiskService 的职责边界** | RiskService = **组合级** 可行性（max_position_pct / max_total_exposure / max_drawdown / min_balance_reserve / max_daily_turnover）; ExecutionService = **订单级** 可执行性（slippage / depth / single+portfolio budget）|
+
+**三项检查说明:**
+
+| 检查 | 判据 | 目的 |
+|------|------|------|
+| 滑点 (slippage) | 按订单簿逐档吃单估算实际成交均价，与 mid_price 的偏差 ≤ `max_slippage_bps` | 防止在薄订单簿上市价单被吃出严重偏差 |
+| 深度 (depth) | 前 N 档累计量 ≥ 订单量 × `min_depth_ratio` | 防止一笔订单把对手方深度全部吃穿，产生异常冲击 |
+| 预算 (budget) | 单笔金额 ≤ `single_order_max_usdt` 且组合本次换仓累计 ≤ `portfolio_budget_max_usdt` | 防止单次换仓因信号异常 / 计算错误产生超额下单 |
+
+**主循环示例:**
+
+```python
+class ExecutionService:
+    """从 order_approved 消费，逐单做质量检查，全部通过才 emit execution_approved。"""
+
+    async def on_order_approved(self, event: OrderApprovedEvent) -> None:
+        target_portfolio = event.target_portfolio
+        current_positions = await self.account_reader.load_positions()
+        deltas = compute_deltas(target_portfolio, current_positions)
+
+        approved: list[CheckedOrder] = []
+        rejected: list[CheckedOrder] = []
+        portfolio_used_usdt = 0.0
+
+        for delta in deltas:
+            orderbook = await self.orderbook_reader.read(
+                delta.symbol, max_age_ms=self.cfg.orderbook_max_age_ms
+            )
+            if orderbook is None:  # 超龄 / 缺失
+                rejected.append(CheckedOrder(delta, reasons=["stale_or_missing_book"]))
+                continue
+
+            slippage_ok, slippage_bps = estimate_slippage(
+                delta.side, delta.amount, orderbook, self.cfg.max_slippage_bps
+            )
+            depth_ok = check_depth(
+                delta.side, delta.amount, orderbook, self.cfg.min_depth_ratio
+            )
+            order_value = delta.amount * orderbook.mid_price
+            budget_ok = check_budget(
+                order_value,
+                self.cfg.single_order_max_usdt,
+                portfolio_used_usdt,
+                self.cfg.portfolio_budget_max_usdt,
+            )
+
+            if slippage_ok and depth_ok and budget_ok:
+                approved.append(CheckedOrder(delta, est_slippage_bps=slippage_bps))
+                portfolio_used_usdt += order_value
+            else:
+                reasons = []
+                if not slippage_ok:
+                    reasons.append(("slippage", slippage_bps))
+                if not depth_ok:
+                    reasons.append(("depth", None))
+                if not budget_ok:
+                    reasons.append(("budget", order_value))
+                rejected.append(CheckedOrder(delta, reasons=reasons))
+
+        # V1 采用 all-or-nothing 语义：任一拒绝则整批拒绝
+        if rejected:
+            self.emit_execution_rejected(event.rebalance_id, approved, rejected)
+        else:
+            self.emit_execution_approved(event.rebalance_id, approved)
+```
+
+**三个独立 checker 的简化实现:**
+
+```python
+# slippage_checker.py
+def estimate_slippage(
+    side: str, amount: float, orderbook: dict, max_slippage_bps: int
+) -> tuple[bool, float]:
+    """按订单簿逐档吃单估算实际成交价，与 mid_price 对比算 bps。"""
+    book = orderbook["asks"] if side == "buy" else orderbook["bids"]
+    mid = (orderbook["asks"][0][0] + orderbook["bids"][0][0]) / 2
+    remaining = amount
+    cost = 0.0
+    for price, qty in book:
+        take = min(remaining, qty)
+        cost += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        return False, float("inf")  # 前 N 档总量不够吃单 → 滑点视为无穷
+    avg_price = cost / amount
+    slippage_bps = abs(avg_price - mid) / mid * 10000
+    return slippage_bps <= max_slippage_bps, slippage_bps
+
+
+# depth_checker.py
+def check_depth(
+    side: str, amount: float, orderbook: dict, min_depth_ratio: float
+) -> bool:
+    """前 10 档的累计量 >= 订单量 × min_depth_ratio。"""
+    book = orderbook["asks"] if side == "buy" else orderbook["bids"]
+    top_n_volume = sum(qty for _, qty in book[:10])
+    return top_n_volume >= amount * min_depth_ratio
+
+
+# budget_checker.py
+def check_budget(
+    order_value_usdt: float,
+    single_max_usdt: float,
+    portfolio_used_usdt: float,
+    portfolio_max_usdt: float,
+) -> bool:
+    """单笔上限 + 组合本次换仓累计上限。"""
+    return (
+        order_value_usdt <= single_max_usdt
+        and portfolio_used_usdt + order_value_usdt <= portfolio_max_usdt
+    )
+```
+
+**执行质量配置 (execution_config.yaml):**
+
+```yaml
+max_slippage_bps: 10                 # 最大允许滑点 (basis points, 10 bps = 0.1%)
+min_depth_ratio: 3.0                 # 前 10 档累计量至少是订单量的 3 倍
+orderbook_max_age_ms: 2000           # 订单簿快照最大新鲜度 (毫秒)
+reject_on_stale_book: true           # 订单簿超龄时是否直接拒绝
+single_order_max_usdt: 5000          # 单笔订单金额上限 (USDT)
+portfolio_budget_max_usdt: 50000     # 本次换仓的组合累计金额上限 (USDT)
+rejection_policy: all_or_nothing     # V1 推荐：任一拒绝则整批拒绝；可选 partial 放行通过的部分
+```
+
+**异常路径:**
+
+| 场景 | 行为 |
+|------|------|
+| `quant:orderbook:{symbol}` 不存在或 TTL 超过 `orderbook_max_age_ms` | 整笔订单记为拒绝原因 `stale_or_missing_book`，按 `rejection_policy` 决定后续 |
+| 前 N 档深度不足以吃完订单量 | `estimate_slippage` 返回 `inf`，滑点检查失败 |
+| 单笔订单通过单笔预算但拖累组合预算超限 | budget 检查失败，reject 时注明当前 `portfolio_used_usdt` |
+| ExecutionService 本身崩溃 | 无状态恢复：重启后只消费新的 `order_approved`，旧事件由 BaseEventService 的 last-run 兜底判断是否补执行 |
+
+#### 2.2.10 Order Service (重构)
 
 | 属性 | 值 |
 |------|-----|
 | **现有文件** | `services/order_service/futures_service.py` |
 | **变更** | 移除策略逻辑 (`_rank_by_momentum`), 只保留下单执行 |
-| **订阅事件** | `order_approved` |
+| **订阅事件** | `execution_approved`（由 ExecutionService 发布；不再直接订阅 `order_approved`） |
 | **发布事件** | `order_executed` / `order_failed` |
 | **新增** | `position_differ.py` (差量计算), `order_executor.py` (重试 + 精度) |
 | **Dry-run** | 配置 `dry_run: true` 时只记录不实际下单 |
@@ -791,7 +951,7 @@ target_positions (来自 StrategyService)
     if delta ≈ 0: skip (低于最小下单量)
 ```
 
-#### 2.2.10 Account Service (新增)
+#### 2.2.11 Account Service (新增)
 
 | 属性 | 值 |
 |------|-----|
@@ -801,7 +961,7 @@ target_positions (来自 StrategyService)
 | **Redis 键** | `quant:account:balance`, `quant:account:positions`, `quant:account:orders` |
 | **设计要点** | 统一调用入口, 避免多个服务同时调用交易所 API 导致限频 |
 
-#### 2.2.11 Monitor Service (新增)
+#### 2.2.12 Monitor Service (新增)
 
 | 属性 | 值 |
 |------|-----|
@@ -822,7 +982,7 @@ Monitor Service 每 30s 扫描:
     若某服务 heartbeat 过期 → 告警
 ```
 
-#### 2.2.12 Backtest Engine (新增)
+#### 2.2.13 Backtest Engine (新增)
 
 | 属性 | 值 |
 |------|-----|
@@ -861,8 +1021,10 @@ for date in all_trading_dates:
 | `quant:bar_normalized` | BarSourceAdapterService | FeatureService |
 | `quant:feature_calculated` | FeatureService | StrategyService |
 | `quant:signal_generated` | StrategyService | RiskService |
-| `quant:order_approved` | RiskService | OrderService |
+| `quant:order_approved` | RiskService | ExecutionService |
 | `quant:risk_rejected` | RiskService | MonitorService |
+| `quant:execution_approved` | ExecutionService | OrderService |
+| `quant:execution_rejected` | ExecutionService | MonitorService |
 | `quant:order_executed` | OrderService | AccountService, MonitorService |
 | `quant:order_failed` | OrderService | MonitorService |
 | `quant:order_rebalanced` | OrderService | MonitorService |
@@ -876,6 +1038,7 @@ for date in all_trading_dates:
 | `market:tickers` | Stream | DataService 写入聚合行情快照 |
 | `market:ohlcv` | Stream | DataService 写入 K 线数据 |
 | `market:orderbook` | Stream | DataService 写入订单簿快照 (bids/asks JSON，深度由 `orderbook_depth_limit` 控制) |
+| `quant:orderbook:{symbol}` | String (JSON) | ★ DataService 覆盖写入的最新 L2 订单簿快照 (bids/asks + mid_price + ts_ms)，ExecutionService 按需读取做滑点/深度检查 |
 | `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 (BarSourceAdapterService 输出) |
 | `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
 | `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
@@ -927,18 +1090,19 @@ for date in all_trading_dates:
 | BarSourceAdapterService | 1024 | 2 GB | 1 | 从 Redis Stream 消费 tick, bar 聚合 + tick 特征计算 |
 | Feature Service | 512 | 1 GB | 1 | |
 | Strategy Service | 256 | 512 MB | 1 | 轻量计算 |
-| Risk Service | 256 | 512 MB | 1 | 规则检查 |
+| Risk Service | 256 | 512 MB | 1 | 组合级规则检查 |
+| Execution Service | 256 | 512 MB | 1 | 逐单滑点/深度/预算检查，仅读 Redis |
 | Order Service | 256 | 512 MB | 1 | API 调用 |
 | Account Service | 256 | 512 MB | 1 | 定时轮询 |
 | Monitor Service | 256 | 512 MB | 1 | 心跳检查 |
 | API Gateway | 512 | 1 GB | 1-2 | 按访问量扩 |
-| **总计** | | | **10-11** | Fargate 按使用计费 |
+| **总计** | | | **11-12** | Fargate 按使用计费 |
 
 **月费估算 (ap-southeast-1):**
 
 ```
 ECS Fargate:
-  10 tasks × 平均 0.5 vCPU × 1 GB × 730h ≈ $30-45/月
+  11 tasks × 平均 0.5 vCPU × 1 GB × 730h ≈ $33-50/月
 
 ElastiCache Redis (cache.t3.small):
   ≈ $25/月
@@ -1036,10 +1200,11 @@ flowchart LR
     Build --> D4["feature-service\n(trading feature)"]
     Build --> D5["strategy-service\n(trading strategy)"]
     Build --> D6["risk-service\n(trading risk)"]
-    Build --> D7["order-service\n(trading futures)"]
-    Build --> D8["account-service\n(trading account --daemon)"]
-    Build --> D9["monitor-service\n(trading monitor)"]
-    Build --> D10["api-gateway\n(system server)"]
+    Build --> D7["execution-service\n(trading execution)"]
+    Build --> D8["order-service\n(trading futures)"]
+    Build --> D9["account-service\n(trading account --daemon)"]
+    Build --> D10["monitor-service\n(trading monitor)"]
+    Build --> D11["api-gateway\n(system server)"]
 ```
 
 ### 3.6 Terraform 模块结构
@@ -1254,14 +1419,16 @@ async def consume_trades(self, symbol: str):
 | 历史长度过滤 (≥60 天) | ❌ | ❌ | ✅ | AssetPoolService / StrategyService |
 | 灵活换仓周期 | R1 | R1 | R14 | StrategyService |
 | 多策略并行 | 单策略 | 多策略集成 | 可独立或集成 | StrategyService |
-| 风控检查 | ✅ | ✅ | ✅ | RiskService |
+| 风控检查 (组合级) | ✅ | ✅ | ✅ | RiskService |
+| 滑点 / 深度 / 预算检查 (订单级) | ✅ | ✅ | ✅ | ExecutionService |
 | 市价单执行 | ✅ | ✅ | ✅ | OrderService |
 
 **分阶段实施:**
 
 | 阶段 | 可运行的策略 | 需要的服务 |
 |------|-----------|-----------|
-| **V1** (MVP) | strategy_4 (rev_1d) | Data + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order |
+| **V1 Sprint 1** (最短闭环) | strategy_4 (rev_1d) | Data + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order（dry-run）|
+| **V1 Sprint 4** (执行可靠性) | 同上 | 上一行 + **ExecutionService**（插入 Risk 与 Order 之间做滑点/深度/预算检查）|
 | **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
 | **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapterService tick 特征启用 + 多策略集成 |
 
@@ -1271,7 +1438,7 @@ async def consume_trades(self, symbol: str):
 |------|------|---------|
 | `vpc` | VPC, 3 Subnet (Public/Private/Data), NAT Gateway, IGW, Route Tables | CIDR: 10.0.0.0/16 |
 | `ecr` | ECR Repository | 镜像保留策略: 最近 10 个 |
-| `ecs` | ECS Cluster, 10 个 Task Definition + Service, Auto Scaling | 见 3.2 资源表 |
+| `ecs` | ECS Cluster, 11 个 Task Definition + Service, Auto Scaling | 见 3.2 资源表 |
 | `redis` | ElastiCache Redis (cache.t3.small, 单节点) | Port 6379, maxmemory-policy: allkeys-lru |
 | `rds` | RDS PostgreSQL 16 (db.t3.small) + TimescaleDB 扩展 | Port 5432, 20GB GP3 |
 | `secrets` | Secrets Manager × 4 (API Key, Private Key, DB Password, Telegram Token) | 自动轮转: 关闭 |
@@ -1377,6 +1544,34 @@ max_order_value: 5000.0
 max_daily_turnover: 3.0
 blacklist: []
 dry_run: true                   # 模拟盘默认 true
+```
+
+### execution_config.yaml
+
+```yaml
+# 执行质量网关 (ExecutionService) 配置
+# 对每笔 delta order 做 滑点 / 深度 / 预算 三项检查，全部通过才 emit execution_approved
+
+# 滑点检查
+max_slippage_bps: 10                 # 最大允许滑点 (basis points, 10 bps = 0.1%)
+
+# 深度检查
+min_depth_ratio: 3.0                 # 前 10 档累计量至少是订单量的 N 倍
+depth_levels: 10                     # 深度检查观察的档位数
+
+# 订单簿新鲜度
+orderbook_max_age_ms: 2000           # 超龄的订单簿快照视为不可用
+reject_on_stale_book: true           # 超龄时是否直接拒绝 (false = 退化为滑点估算)
+
+# 预算检查
+single_order_max_usdt: 5000          # 单笔订单金额上限 (USDT)
+portfolio_budget_max_usdt: 50000     # 本次换仓的组合累计金额上限 (USDT)
+
+# 拒绝策略
+rejection_policy: all_or_nothing     # all_or_nothing (推荐，V1) | partial (放行通过的部分)
+
+# Redis 读取
+orderbook_key_pattern: "quant:orderbook:{symbol}"
 ```
 
 ### monitor_config.yaml

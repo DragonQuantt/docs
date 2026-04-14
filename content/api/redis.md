@@ -56,7 +56,9 @@
 
 ## 三、V1 Pub/Sub 通道契约
 
-V1 共 9 个通道，覆盖 strategy_2 (baseline_rev) 的完整交易闭环。
+V1 共 11 个通道，覆盖 strategy_2 (baseline_rev) 的完整交易闭环。
+
+> **说明**：`quant:execution_approved` 与 `quant:execution_rejected` 由 ExecutionService 发布，**在 V1 Sprint 4 "风控前置与执行可靠性" 引入**。V1 Sprint 1 最短闭环阶段允许 OrderService 直接订阅 `quant:order_approved`；Sprint 4 后必须经 ExecutionService 接管。
 
 ### 3.1 通道总览
 
@@ -66,8 +68,10 @@ flowchart LR
     Aggregator -->|kline_aggregated| Feature["FeatureService"]
     Feature -->|feature_calculated| Strategy["StrategyService"]
     Strategy -->|signal_generated| Risk["RiskService"]
-    Risk -->|order_approved| Order["OrderService"]
+    Risk -->|order_approved| Execution["ExecutionService"]
     Risk -.->|risk_rejected| Monitor["MonitorService"]
+    Execution -->|execution_approved| Order["OrderService"]
+    Execution -.->|execution_rejected| Monitor
     Order -->|order_executed| Account["AccountService"]
     Order -.->|order_failed| Monitor
     Account -->|account_updated| Risk
@@ -79,8 +83,10 @@ flowchart LR
 | `quant:kline_aggregated` | AggregatorService | FeatureService | 每根 K 线 |
 | `quant:feature_calculated` | FeatureService | StrategyService | 每次特征更新 |
 | `quant:signal_generated` | StrategyService | RiskService | 每次换仓（R1: 每日 23:59 UTC） |
-| `quant:order_approved` | RiskService | OrderService | 风控通过时 |
+| `quant:order_approved` | RiskService | ExecutionService (Sprint 4+) / OrderService (Sprint 1-3) | 风控通过时 |
 | `quant:risk_rejected` | RiskService | MonitorService | 风控拒绝时 |
+| `quant:execution_approved` | ExecutionService | OrderService | 执行质量通过时（Sprint 4+）|
+| `quant:execution_rejected` | ExecutionService | MonitorService | 执行质量拒绝时（Sprint 4+）|
 | `quant:order_executed` | OrderService | AccountService, MonitorService | 每笔订单执行后 |
 | `quant:order_failed` | OrderService | MonitorService | 订单失败时 |
 | `quant:account_updated` | AccountService | RiskService | 每 30s 轮询后 |
@@ -323,6 +329,121 @@ K 线数据已聚合，可进行特征计算。
 | `risk_check_summary.rules_passed` | int | 是 | 通过规则数 |
 | `risk_check_summary.{rule_name}` | object | 是 | 每条规则的 threshold / actual / passed |
 | `target_portfolio` | object | 是 | 批准的目标仓位 (结构同 signal_generated) |
+
+> **Sprint 3 及之前**：订阅者为 OrderService，执行 `target_portfolio` 后直接 emit `order_executed`。
+> **Sprint 4 起**：订阅者改为 ExecutionService，后者做滑点/深度/预算检查后再 emit `execution_approved` 或 `execution_rejected`。
+
+---
+
+### 3.6.1 `quant:execution_approved` [Sprint 4+]
+
+执行质量网关对 `order_approved` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过后发布此事件，OrderService 消费后执行真实下单。
+
+**触发条件**: ExecutionService 对 `quant:order_approved` 中的 `target_portfolio` 展开为 delta orders 后，每一笔都通过三项检查。
+
+**`data` 载荷**:
+
+```json
+{
+  "rebalance_id": "rb-20260302-001",
+  "strategy_name": "baseline_rev",
+  "approved_at": "2026-03-02T23:59:01Z",
+  "execution_check_summary": {
+    "total_orders": 60,
+    "approved_orders": 60,
+    "rejected_orders": 0,
+    "max_slippage_bps": { "threshold": 10, "actual_max": 7.2, "passed": true },
+    "min_depth_ratio": { "threshold": 3.0, "actual_min": 4.5, "passed": true },
+    "single_order_max_usdt": { "threshold": 5000, "actual_max": 4820.50, "passed": true },
+    "portfolio_budget_max_usdt": { "threshold": 50000, "actual": 42100.30, "passed": true }
+  },
+  "approved_orders": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "side": "buy",
+      "amount": 0.005,
+      "est_avg_price": 62458.30,
+      "est_order_value_usdt": 312.29,
+      "est_slippage_bps": 1.3,
+      "orderbook_snapshot_age_ms": 450
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `rebalance_id` | string | 是 | 换仓 ID（来自 `order_approved`）|
+| `strategy_name` | string | 是 | 策略名 |
+| `approved_at` | string (ISO 8601) | 是 | 批准时间 |
+| `execution_check_summary` | object | 是 | 三项检查摘要 |
+| `execution_check_summary.total_orders` | int | 是 | 本次换仓涉及的 delta order 总数 |
+| `execution_check_summary.approved_orders` | int | 是 | 通过的 delta order 数 |
+| `execution_check_summary.rejected_orders` | int | 是 | 拒绝的 delta order 数（本事件中恒为 0）|
+| `execution_check_summary.{check_name}` | object | 是 | 每项检查的 `threshold / actual / passed` 摘要 |
+| `approved_orders` | object[] | 是 | 通过质量检查的 delta order 列表 |
+| `approved_orders[].symbol` | string | 是 | 交易对 |
+| `approved_orders[].side` | string | 是 | `"buy"` \| `"sell"` |
+| `approved_orders[].amount` | float | 是 | 订单量（基础币）|
+| `approved_orders[].est_avg_price` | float | 是 | 按订单簿逐档吃单估算的平均成交价 |
+| `approved_orders[].est_order_value_usdt` | float | 是 | 估算订单金额（USDT）|
+| `approved_orders[].est_slippage_bps` | float | 是 | 估算滑点（basis points）|
+| `approved_orders[].orderbook_snapshot_age_ms` | int | 是 | 引用的订单簿快照新鲜度（毫秒）|
+
+---
+
+### 3.6.2 `quant:execution_rejected` [Sprint 4+]
+
+执行质量检查失败。在 `rejection_policy=all_or_nothing` 下，任一 delta order 未通过即整批拒绝，不会下单。
+
+**触发条件**: ExecutionService 检查到至少一笔 delta order 未通过滑点 / 深度 / 预算任一检查；或订单簿快照超龄缺失。
+
+**`data` 载荷**:
+
+```json
+{
+  "rebalance_id": "rb-20260302-001",
+  "strategy_name": "baseline_rev",
+  "rejected_at": "2026-03-02T23:59:01Z",
+  "severity": "warning",
+  "rejection_policy": "all_or_nothing",
+  "rejected_orders": [
+    {
+      "symbol": "XRP/USDT:USDT",
+      "side": "sell",
+      "amount": 150.0,
+      "est_order_value_usdt": 78.30,
+      "reasons": [
+        { "check": "slippage", "threshold_bps": 10, "actual_bps": 23.5 },
+        { "check": "depth", "threshold_ratio": 3.0, "actual_ratio": 1.2 }
+      ]
+    }
+  ],
+  "approved_orders_count": 0,
+  "action_taken": "skip_rebalance"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `rebalance_id` | string | 是 | 换仓 ID |
+| `strategy_name` | string | 是 | 策略名 |
+| `rejected_at` | string (ISO 8601) | 是 | 拒绝时间 |
+| `severity` | string | 是 | `"warning"` \| `"critical"` |
+| `rejection_policy` | string | 是 | `"all_or_nothing"` \| `"partial"` |
+| `rejected_orders` | object[] | 是 | 被拒绝的 delta order 列表 |
+| `rejected_orders[].symbol` | string | 是 | 交易对 |
+| `rejected_orders[].side` | string | 是 | `"buy"` \| `"sell"` |
+| `rejected_orders[].amount` | float | 是 | 订单量 |
+| `rejected_orders[].est_order_value_usdt` | float | 是 | 估算订单金额（USDT）|
+| `rejected_orders[].reasons` | object[] | 是 | 触发拒绝的检查项列表 |
+| `rejected_orders[].reasons[].check` | string | 是 | `"slippage"` \| `"depth"` \| `"budget"` \| `"stale_or_missing_book"` |
+| `rejected_orders[].reasons[].threshold_bps` | float | 否 | 滑点阈值（bps）|
+| `rejected_orders[].reasons[].actual_bps` | float | 否 | 实际估算滑点（bps）|
+| `rejected_orders[].reasons[].threshold_ratio` | float | 否 | 深度阈值 |
+| `rejected_orders[].reasons[].actual_ratio` | float | 否 | 实际深度比 |
+| `approved_orders_count` | int | 是 | 同批次中通过检查的 order 数（`all_or_nothing` 模式下仅用于审计）|
+| `action_taken` | string | 是 | `"skip_rebalance"` \| `"partial_execute"` |
 
 ---
 

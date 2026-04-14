@@ -39,11 +39,18 @@ feature_calculated
   -> account_updated
 ```
 
+> **注**：执行质量网关 **ExecutionService**（滑点/深度/预算检查，详见 [architecture §2.2.9](../architecture/index.md)）在 **V1 Sprint 4** 插入到 Risk 与 Order 之间。Sprint 1 最短闭环阶段 OrderService 直接订阅 `order_approved` 以加速打通；Sprint 4 接入 ExecutionService 后，OrderService 改订阅 `execution_approved`，事件链变为：
+>
+> ```
+> signal_generated -> order_approved -> execution_approved / execution_rejected -> order_executed
+> ```
+
 核心不变量:
 
 1. 任何订单请求必须先过 RiskService
 2. 风控拒绝后不得继续下单
 3. 同一业务请求不得重复下单（幂等）
+4. **Sprint 4 起**：任何真实下单必须先过 ExecutionService 的滑点/深度/预算三项检查
 
 ---
 
@@ -193,6 +200,9 @@ feature_calculated
 | 风控规则落地 | max_position/exposure/drawdown/reserve/turnover | 模拟盘默认启用 |
 | 风控接口 | `GET /api/v1/risk/status`, `GET /api/v1/risk/alerts`, `GET /api/v1/risk/config` | 状态与审计 |
 | 系统控制 | `POST /api/v1/system/emergency-stop`, `POST /api/v1/risk/symbols/disable` | 紧急停机 + 停用交易对 |
+| **执行质量网关** | `ExecutionService` + slippage/depth/budget checker | 插入 Risk 与 Order 之间，从 `quant:orderbook:{symbol}` 读订单簿做三项检查；OrderService 改订阅 `execution_approved` |
+| **执行配置** | `execution_config.yaml` | max_slippage_bps / min_depth_ratio / orderbook_max_age_ms / single_order_max_usdt / portfolio_budget_max_usdt / rejection_policy |
+| **订单簿快照键** | DataService 覆盖写 `quant:orderbook:{symbol}` | 供 ExecutionService 读取，新鲜度由 `orderbook_max_age_ms` 校验 |
 | 订单审计接口 | `GET /api/v1/orders/history`, `GET /api/v1/orders/trades`, `GET /api/v1/orders/rebalance-history` | 全链路追踪 |
 | 活跃挂单 | `GET /api/v1/account/open-orders` | 挂单查询 |
 | 组合完整指标 | `GET /api/v1/portfolio/nav`, `pnl`, `drawdown`, `position-deviation`, `volatility` | NAV 曲线、PnL、回撤、偏差、波动率 |
@@ -221,7 +231,9 @@ feature_calculated
 
 - `WS /ws/alerts` (实时事件触发)
 
-**Redis 键**: `quant:risk:status`, `quant:risk:disabled_symbols`, `quant:system:emergency_stop`
+**Redis 键**: `quant:risk:status`, `quant:risk:disabled_symbols`, `quant:system:emergency_stop`, `quant:orderbook:{symbol}`
+
+**Redis 事件新增**: `quant:execution_approved`、`quant:execution_rejected`（详见 [redis.md §3.6.1 / §3.6.2](../api/redis.md)）；`quant:order_approved` 订阅者从 OrderService 改为 ExecutionService。
 
 #### 验收标准
 
@@ -229,6 +241,9 @@ feature_calculated
 - [ ] 订单失败均可审计并告警
 - [ ] 连续运行 24h 无阻塞故障
 - [ ] 14 个 HTTP 端点均可返回正确数据
+- [ ] 异常订单簿（超龄 > 2s 或深度不足）能被 ExecutionService 拦截，不走到 OrderService
+- [ ] `execution_rejected` 事件能被 MonitorService 接收并触发 `WS /ws/alerts` 告警
+- [ ] `quant:order_approved` 消费者从代码层面确认是 ExecutionService，OrderService 不再直接订阅
 
 ---
 
