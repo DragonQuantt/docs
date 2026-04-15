@@ -219,9 +219,11 @@ K 线数据已聚合，可进行特征计算。
 
 ### 3.5 `quant:signal_generated`
 
-策略信号生成完毕，目标仓位提交风控审核。
+策略选股 + 方向生成完毕，交给 RiskService 做 sizing。
 
 **触发条件**: StrategyService 在换仓时点（baseline_rev: 每日 23:59 UTC）调用 `generate_signal()` 后。
+
+> **重要**：V1 重构后，策略**不再**在此事件里计算仓位大小。`data.signals[]` 只含 `symbol / side / signal_value / reason`，`weight` 字段已删除。仓位 USDT 名义金额由下游 RiskService 决定，详见 §3.6。
 
 **`data` 载荷**:
 
@@ -232,18 +234,16 @@ K 线数据已聚合，可进行特征计算。
   "rebalance_id": "rb-20260302-001",
   "mode": "single",
   "pool_name": "default",
-  "positions": [
+  "signals": [
     {
       "symbol": "BTC/USDT:USDT",
       "side": "long",
-      "weight": 0.0167,
       "signal_value": 1.85,
       "reason": "baseline_rev_long"
     },
     {
       "symbol": "DOGE/USDT:USDT",
       "side": "short",
-      "weight": -0.0167,
       "signal_value": -2.10,
       "reason": "baseline_rev_short"
     }
@@ -252,8 +252,9 @@ K 线数据已聚合，可进行特征计算。
     "n_candidates": 480,
     "long_count": 30,
     "short_count": 30,
-    "weight_per_symbol": 0.0167,
-    "skipped": false
+    "skipped": false,
+    "cross_section_std": 0.72,
+    "stale_symbols_count": 0
   }
 }
 ```
@@ -265,73 +266,101 @@ K 线数据已聚合，可进行特征计算。
 | `rebalance_id` | string | 是 | 本次换仓唯一 ID |
 | `mode` | string | 是 | 策略模式。V1 固定 `"single"` |
 | `pool_name` | string | 是 | 使用的资产池 |
-| `positions` | TargetPosition[] | 是 | 目标仓位列表 |
-| `metadata` | object | 是 | 调试信息 |
+| `signals` | StrategySignal[] | 是 | 策略选出的标的列表（**不含 sizing**） |
+| `metadata` | object | 是 | 调试信息（n_candidates / long_count / short_count / skipped / ...） |
 
-**TargetPosition 结构**:
+**StrategySignal 结构**:
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `symbol` | string | 是 | 交易对 |
 | `side` | string | 是 | `"long"` \| `"short"` |
-| `weight` | float | 是 | 占总资金比例。正值做多，负值做空 |
-| `signal_value` | float | 是 | 原始信号值 |
+| `signal_value` | float | 是 | 原始信号值（例如 z-score） |
 | `reason` | string | 是 | 可读说明 |
 
 ---
 
 ### 3.6 `quant:risk_approved`
 
-风控通过，允许执行下单。
+风控完成 sizing，把每个仓位的 USDT 名义金额交给 ExecutionService。
 
-**触发条件**: RiskService 对 `signal_generated` 的所有规则检查全部通过。
+**触发条件**: RiskService 消费 `signal_generated`，按 `reject_symbols` 过滤后调用 `_size_positions` 打上 USDT 名义金额，组合级检查（Sprint 4）全部通过。
 
-**`data` 载荷**:
+**`data` 载荷**（= `SizedPortfolio.to_dict()` + 透传 `rebalance_id / mode / pool_name`）:
 
 ```json
 {
   "rebalance_id": "rb-20260302-001",
+  "mode": "single",
+  "pool_name": "default",
   "strategy_name": "baseline_rev",
-  "approved_at": "2026-03-02T23:59:01Z",
-  "risk_check_summary": {
-    "rules_checked": 5,
-    "rules_passed": 5,
-    "max_position_pct": { "threshold": 0.15, "actual": 0.0167, "passed": true },
-    "max_total_exposure": { "threshold": 1.0, "actual": 1.0, "passed": true },
-    "max_drawdown_halt": { "threshold": 0.30, "actual": 0.053, "passed": true },
-    "min_balance_reserve": { "threshold": 100.0, "actual": 5120.30, "passed": true },
-    "max_daily_turnover": { "threshold": 3.0, "actual": 0.45, "passed": true }
+  "signal_timestamp": "2026-03-02T23:59:00+00:00",
+  "positions": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "side": "long",
+      "notional_usdt": 100.0,
+      "signal_value": 1.85,
+      "reason": "baseline_rev_long"
+    },
+    {
+      "symbol": "DOGE/USDT:USDT",
+      "side": "short",
+      "notional_usdt": 100.0,
+      "signal_value": -2.10,
+      "reason": "baseline_rev_short"
+    }
+  ],
+  "sizing_metadata": {
+    "sizing_scheme": "hardcoded_placeholder",
+    "per_position_notional_usdt": 100.0,
+    "total_notional_usdt": 6000.0,
+    "note": "Sprint 4 will replace this with equity-based sizing; current value is a fixed stub constant."
   },
-  "target_portfolio": {
-    "strategy_name": "baseline_rev",
-    "positions": [
-      {
-        "symbol": "BTC/USDT:USDT",
-        "side": "long",
-        "weight": 0.0167,
-        "signal_value": 1.85,
-        "reason": "baseline_rev_long"
-      }
-    ],
+  "strategy_metadata": {
+    "n_candidates": 480,
     "long_count": 30,
-    "short_count": 30
+    "short_count": 30,
+    "skipped": false,
+    "cross_section_std": 0.72,
+    "stale_symbols_count": 0
   }
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID (来自 signal_generated) |
+| `rebalance_id` | string | 是 | 换仓 ID（来自 signal_generated） |
+| `mode` | string | 是 | 策略模式，透传 |
+| `pool_name` | string | 是 | 资产池，透传 |
 | `strategy_name` | string | 是 | 策略名 |
-| `approved_at` | string (ISO 8601) | 是 | 批准时间 |
-| `risk_check_summary` | object | 是 | 风控检查摘要 |
-| `risk_check_summary.rules_checked` | int | 是 | 检查规则总数 |
-| `risk_check_summary.rules_passed` | int | 是 | 通过规则数 |
-| `risk_check_summary.{rule_name}` | object | 是 | 每条规则的 threshold / actual / passed |
-| `target_portfolio` | object | 是 | 批准的目标仓位 (结构同 signal_generated) |
+| `signal_timestamp` | string (ISO 8601) | 是 | 策略信号生成时间 |
+| `positions` | SizedPosition[] | 是 | 每个仓位的 USDT 名义金额列表 |
+| `sizing_metadata` | object | 是 | sizing 决策过程的输入和结果 |
+| `strategy_metadata` | object | 是 | 透传 `StrategySignalBatch.metadata` |
 
-> **Sprint 3 及之前**：订阅者为 OrderService，执行 `target_portfolio` 后直接 emit `order_executed`。
-> **Sprint 4 起**：订阅者改为 ExecutionService，后者做滑点/深度/预算检查后再 emit `execution_approved` 或 `execution_rejected`。
+**SizedPosition 结构**:
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `symbol` | string | 是 | 交易对 |
+| `side` | string | 是 | `"long"` \| `"short"` |
+| `notional_usdt` | float | 是 | USDT 名义金额。**始终为正数**，方向由 `side` 决定 |
+| `signal_value` | float | 是 | 来自策略的原始信号值 |
+| `reason` | string | 是 | 可读说明（透传自 StrategySignal） |
+
+**sizing_metadata 字段**（V1 Sprint 1–3 硬编码 stub 形态）:
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sizing_scheme` | string | 当前恒为 `"hardcoded_placeholder"`；Sprint 4 扩展为 `equal_notional` / `signal_proportional` / `vol_target` |
+| `per_position_notional_usdt` | float | 每仓分配的 USDT 名义金额（stub: 100.0） |
+| `total_notional_usdt` | float | 所有仓位 notional 之和 |
+| `note` | string | 人读提示，说明当前是 stub，Sprint 4 会替换 |
+
+> **V1 Sprint 1–3（当前）**：`sizing_metadata.sizing_scheme == "hardcoded_placeholder"`，每仓固定 100 USDT，不读账户权益；Risk 不做任何组合级 gate，始终 emit `risk_approved`。
+> **V1 Sprint 4**：实装基于 `quant:account:balance` 的真实 sizing + 五项组合级检查（max_position / total_exposure / drawdown / reserve / turnover）。`sizing_metadata` 会扩展 `base_equity_usdt` / `equity_source` / `target_gross_usdt` / `cap_applied_count` 等字段。
+> **订阅方**：Sprint 1–3 允许 OrderService 直接订阅；Sprint 4 起统一由 ExecutionService 接手 → 做滑点/深度/预算检查后再 emit `execution_approved` 或 `execution_rejected`。
 
 ---
 
@@ -339,7 +368,7 @@ K 线数据已聚合，可进行特征计算。
 
 执行质量网关对 `risk_approved` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过后发布此事件，OrderService 消费后执行真实下单。
 
-**触发条件**: ExecutionService 对 `quant:risk_approved` 中的 `target_portfolio` 展开为 delta orders 后，每一笔都通过三项检查。
+**触发条件**: ExecutionService 消费 `quant:risk_approved`，用 `quant:orderbook:{symbol}.mid_price` 把每个 `SizedPosition.notional_usdt` 换算成合约张数（`amount = notional_usdt / mid_price`），对比当前持仓生成 delta orders，每一笔都通过三项检查。
 
 **`data` 载荷**:
 
@@ -641,7 +670,8 @@ V1 所需的全部 Redis 键:
 | `quant:asset_pool:{exchange}` | Set | 默认资产池 (Top-100 symbols) | AssetPoolService |
 | `quant:kline:{symbol}:{timeframe}` | String (JSON) | 最新 K 线快照 | AggregatorService |
 | `quant:features:latest:{symbol}` | String (JSON) | 最新特征快照 | FeatureService |
-| `quant:signal:latest` | String (JSON) | 最新策略目标仓位 | StrategyService |
+| `quant:signal:latest` | String (JSON) | 最新策略信号快照（StrategySignalBatch，**不含** sizing） | StrategyService |
+| `quant:risk:latest` | String (JSON) | 最新风控后的目标组合（SizedPortfolio，USDT 名义金额） | RiskService |
 | `quant:account:balance` | String (JSON) | 账户余额快照 | AccountService |
 | `quant:account:positions` | String (JSON) | 当前持仓快照 | AccountService |
 | `quant:account:orders` | String (JSON) | 活跃挂单快照 | AccountService |
@@ -670,20 +700,50 @@ V1 所需的全部 Redis 键:
 }
 ```
 
-**`quant:signal:latest`**:
+**`quant:signal:latest`**（StrategyService 写入，**不含** sizing；结构与 `quant:signal_generated` 事件载荷一致）:
 
 ```json
 {
   "strategy_name": "baseline_rev",
   "mode": "single",
-  "signal_timestamp": "2026-03-02T23:59:00Z",
+  "signal_timestamp": "2026-03-02T23:59:00+00:00",
   "rebalance_id": "rb-20260302-001",
-  "positions": [
-    { "symbol": "BTC/USDT:USDT", "side": "long", "weight": 0.0167, "signal_value": 1.85 },
-    { "symbol": "DOGE/USDT:USDT", "side": "short", "weight": -0.0167, "signal_value": -2.10 }
+  "pool_name": "default",
+  "signals": [
+    { "symbol": "BTC/USDT:USDT", "side": "long", "signal_value": 1.85, "reason": "baseline_rev_long" },
+    { "symbol": "DOGE/USDT:USDT", "side": "short", "signal_value": -2.10, "reason": "baseline_rev_short" }
   ],
-  "long_count": 30,
-  "short_count": 30
+  "metadata": {
+    "n_candidates": 480,
+    "long_count": 30,
+    "short_count": 30,
+    "skipped": false,
+    "cross_section_std": 0.72,
+    "stale_symbols_count": 0
+  }
+}
+```
+
+**`quant:risk:latest`**（RiskService 写入，USDT 名义金额；结构与 `quant:risk_approved` 事件载荷一致）:
+
+```json
+{
+  "strategy_name": "baseline_rev",
+  "signal_timestamp": "2026-03-02T23:59:00+00:00",
+  "rebalance_id": "rb-20260302-001",
+  "mode": "single",
+  "pool_name": "default",
+  "positions": [
+    { "symbol": "BTC/USDT:USDT", "side": "long", "notional_usdt": 100.0, "signal_value": 1.85, "reason": "baseline_rev_long" },
+    { "symbol": "DOGE/USDT:USDT", "side": "short", "notional_usdt": 100.0, "signal_value": -2.10, "reason": "baseline_rev_short" }
+  ],
+  "sizing_metadata": {
+    "sizing_scheme": "hardcoded_placeholder",
+    "per_position_notional_usdt": 100.0,
+    "total_notional_usdt": 6000.0,
+    "note": "Sprint 4 will replace this with equity-based sizing; current value is a fixed stub constant."
+  },
+  "strategy_metadata": { "n_candidates": 480, "long_count": 30, "short_count": 30, "skipped": false }
 }
 ```
 
@@ -1059,27 +1119,26 @@ V2 在 V1 特征基础上新增以下字段：
 
 **V2 `quant:signal:latest` 扩展**:
 
-多策略模式下增加 `per_strategy` 字段：
+多策略模式下增加 `per_strategy` 字段，每条子策略提供自己的 `signals`（无 sizing）和 ensemble 权重（注意：这里的 `weight` 是**策略集成权重**，不是单仓位权重）：
 
 ```json
 {
   "mode": "ensemble",
   "ensemble_method": "weighted_average",
-  "signal_timestamp": "2026-03-02T23:59:00Z",
-  "positions": [ ],
-  "long_count": 20,
-  "short_count": 20,
+  "signal_timestamp": "2026-03-02T23:59:00+00:00",
+  "signals": [ ],
+  "metadata": { "long_count": 20, "short_count": 20 },
   "per_strategy": [
     {
       "strategy_name": "baseline_rev",
-      "weight": 0.3,
+      "ensemble_weight": 0.3,
       "pool_name": "default",
       "long_count": 30,
       "short_count": 30
     },
     {
       "strategy_name": "ofi_14d",
-      "weight": 0.4,
+      "ensemble_weight": 0.4,
       "pool_name": "t50_monthly",
       "long_count": 15,
       "short_count": 15

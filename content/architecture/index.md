@@ -95,8 +95,12 @@ class BaseStrategy(ABC):
         features: Dict[str, FeatureVector],
         current_positions: Dict[str, float],
         timestamp: datetime,
-    ) -> TargetPortfolio:
-        """输入特征 → 输出目标仓位权重"""
+    ) -> StrategySignalBatch:
+        """输入特征 → 输出选股 + 方向（**不含仓位大小**）。
+
+        Sizing（每仓 USDT 名义金额）由 RiskService 负责计算；策略只回答
+        "买什么 / 买不买 / 做多还是做空"。
+        """
 
     def should_skip_rebalance(
         self, n_candidates: int, cross_section_std: float
@@ -104,21 +108,42 @@ class BaseStrategy(ABC):
         """子类可覆写，定义跳过换仓的条件。"""
         return False
 
-@dataclass
-class TargetPortfolio:
-    positions: Dict[str, TargetPosition]  # symbol -> weight
-    strategy_name: str
-    signal_timestamp: datetime
-    metadata: Dict[str, Any]  # 可选调试信息
+# ---- Strategy → Risk ----（无 sizing 信息）
+
+@dataclass(frozen=True)
+class StrategySignal:
+    symbol: str
+    side: str          # "long" | "short"
+    signal_value: float
+    reason: str        # 可读说明
 
 @dataclass
-class TargetPosition:
+class StrategySignalBatch:
+    signals: List[StrategySignal]
+    strategy_name: str
+    signal_timestamp: datetime
+    metadata: Dict[str, Any]  # n_candidates / long_count / short_count / skipped / cross_section_std
+
+# ---- Risk → Execution ----（USDT 名义金额；方向由 side 表达）
+
+@dataclass(frozen=True)
+class SizedPosition:
     symbol: str
-    side: str         # "long" | "short"
-    weight: float     # 占总资金的比例, e.g. +0.0167 (= 1/60)
+    side: str                  # "long" | "short"
+    notional_usdt: float       # **始终为正数**，方向由 side 决定
     signal_value: float
-    reason: str       # 可读说明
+    reason: str
+
+@dataclass
+class SizedPortfolio:
+    positions: List[SizedPosition]
+    strategy_name: str
+    signal_timestamp: datetime
+    sizing_metadata: Dict[str, Any]    # sizing_scheme / per_position_notional_usdt / total_notional_usdt / ...
+    strategy_metadata: Dict[str, Any]  # 透传 StrategySignalBatch.metadata
 ```
+
+> **V1 Sprint 1–3 状态**：RiskService 的 `_size_positions` 是**硬编码 stub**（`PLACEHOLDER_NOTIONAL_USDT = 100.0`），`sizing_metadata.sizing_scheme` 恒为 `"hardcoded_placeholder"`。Sprint 4 会替换为基于 `quant:account:balance`（`total_equity` / `available_balance`）的等权 / 信号加权 / 波动率目标方案，并配套 `sizing_scheme` / `equity_source` / `target_gross_exposure` / `max_position_notional_usdt` 等 yaml 字段。
 
 **strategy_4 (rev_1d) 实现示例:**
 
@@ -131,36 +156,38 @@ class Rev1dStrategy(BaseStrategy):
         self.short_n = short_n
 
     def generate_signal(self, features, current_positions, timestamp):
-        signals = {}
+        scores = {}
         for symbol, feat in features.items():
             z1d = feat.get("zscore_neg_ret_1d")
             if z1d is not None:
-                signals[symbol] = z1d
+                scores[symbol] = z1d
 
-        ranked = sorted(signals.items(), key=lambda x: x[1])
-        total = self.long_n + self.short_n
-        weight_per_symbol = 1.0 / total
+        ranked = sorted(scores.items(), key=lambda x: x[1])
 
-        positions = {}
+        batch_signals: list[StrategySignal] = []
         for symbol, val in ranked[-self.long_n:]:
-            positions[symbol] = TargetPosition(
-                symbol=symbol, side="long",
-                weight=+weight_per_symbol, signal_value=val,
-                reason="rev_1d_long"
+            batch_signals.append(
+                StrategySignal(
+                    symbol=symbol, side="long",
+                    signal_value=val, reason="rev_1d_long",
+                )
             )
         for symbol, val in ranked[:self.short_n]:
-            positions[symbol] = TargetPosition(
-                symbol=symbol, side="short",
-                weight=-weight_per_symbol, signal_value=val,
-                reason="rev_1d_short"
+            batch_signals.append(
+                StrategySignal(
+                    symbol=symbol, side="short",
+                    signal_value=val, reason="rev_1d_short",
+                )
             )
-        return TargetPortfolio(
-            positions=positions,
+        return StrategySignalBatch(
+            signals=batch_signals,
             strategy_name="rev_1d",
             signal_timestamp=timestamp,
-            metadata={"n_candidates": len(signals)},
+            metadata={"n_candidates": len(scores)},
         )
 ```
+
+注意示例中**没有 `weight` 计算**——仓位大小在 RiskService 阶段决定。
 
 **策略汇总表 (strategy_1 / strategy_4 / strategy_3):**
 
@@ -387,7 +414,7 @@ quant_trading_backend/
 │   │       └── account.py                # BalanceResponse, PositionItem 等
 │   │
 │   └── domain/                           # 领域模型
-│       ├── portfolio.py                  # TargetPortfolio / TargetPosition
+│       ├── portfolio.py                  # StrategySignal / StrategySignalBatch / SizedPosition / SizedPortfolio
 │       └── features.py                   # FeatureVector 标准接口
 │
 └── tests/
@@ -601,7 +628,7 @@ def calculate_zscore(values: List[float], window: int = 30, negate: bool = False
 | **新增文件** | `services/strategy_service/` |
 | **订阅事件** | `feature_calculated` |
 | **发布事件** | `signal_generated` |
-| **核心逻辑** | 加载配置中指定的策略, 调用 `generate_signal()`, 输出 TargetPortfolio |
+| **核心逻辑** | 加载配置中指定的策略, 调用 `generate_signal()`, 输出 `StrategySignalBatch`（只含选股 + 方向，不含 sizing；sizing 由 RiskService 做） |
 | **多策略支持** | StrategyRegistry 注册表 + ensemble 加权聚合 |
 | **调度** | 按策略独立换仓周期调度: R1 策略每日 23:59 UTC 触发, R14 策略每 14 个交易日触发 |
 | **资产池路由** | 根据策略配置的 `pool_name` 从对应的 Redis 池键读取候选标的 |
@@ -652,36 +679,38 @@ class Ofi14dStrategy(BaseStrategy):
         self.min_candidates = min_candidates
 
     def generate_signal(self, features, current_positions, timestamp):
-        signals = {}
+        scores = {}
         for symbol, feat in features.items():
             ofi_14d_value = feat.get("ofi_14d")
             if ofi_14d_value is not None and not math.isnan(ofi_14d_value):
-                signals[symbol] = ofi_14d_value
+                scores[symbol] = ofi_14d_value
 
-        if self.should_skip_rebalance(len(signals), self._cross_section_std(signals)):
-            return TargetPortfolio(
-                positions={}, strategy_name="ofi_14d",
+        if self.should_skip_rebalance(len(scores), self._cross_section_std(scores)):
+            return StrategySignalBatch(
+                signals=[], strategy_name="ofi_14d",
                 signal_timestamp=timestamp, metadata={"skipped": True},
             )
 
-        ranked = sorted(signals.items(), key=lambda x: x[1])
-        weight_long = 0.5 / self.long_n
-        weight_short = 0.5 / self.short_n
+        ranked = sorted(scores.items(), key=lambda x: x[1])
 
-        positions = {}
+        batch_signals: list[StrategySignal] = []
         for symbol, val in ranked[-self.long_n:]:
-            positions[symbol] = TargetPosition(
-                symbol=symbol, side="long",
-                weight=+weight_long, signal_value=val, reason="ofi_14d_long",
+            batch_signals.append(
+                StrategySignal(
+                    symbol=symbol, side="long",
+                    signal_value=val, reason="ofi_14d_long",
+                )
             )
         for symbol, val in ranked[:self.short_n]:
-            positions[symbol] = TargetPosition(
-                symbol=symbol, side="short",
-                weight=-weight_short, signal_value=val, reason="ofi_14d_short",
+            batch_signals.append(
+                StrategySignal(
+                    symbol=symbol, side="short",
+                    signal_value=val, reason="ofi_14d_short",
+                )
             )
-        return TargetPortfolio(
-            positions=positions, strategy_name="ofi_14d",
-            signal_timestamp=timestamp, metadata={"n_candidates": len(signals)},
+        return StrategySignalBatch(
+            signals=batch_signals, strategy_name="ofi_14d",
+            signal_timestamp=timestamp, metadata={"n_candidates": len(scores)},
         )
 
     def should_skip_rebalance(self, n_candidates: int, cross_section_std: float) -> bool:
@@ -761,21 +790,62 @@ parameters:
 | 属性 | 值 |
 |------|-----|
 | **新增文件** | `services/risk_service/` |
-| **订阅事件** | `signal_generated` |
-| **发布事件** | `risk_approved` 或 `risk_rejected` |
-| **核心逻辑** | 对 TargetPortfolio 逐条规则检查, 全部通过才 emit risk_approved |
+| **订阅事件** | `signal_generated`（payload = `StrategySignalBatch`） |
+| **发布事件** | `risk_approved`（payload = `SizedPortfolio`） 或 `risk_rejected` |
+| **核心逻辑** | (1) 按 `reject_symbols` 过滤 signal；(2) 调用 `_size_positions` 给每个 signal 打 USDT 名义金额；(3) 组合级检查（Sprint 4）；(4) emit `SizedPortfolio` 到 `risk_approved`，同时覆盖写 `quant:risk:latest` |
 
-**风控规则配置 (risk_config.yaml):**
+##### Position Sizing
+
+RiskService 是**唯一**决定"每个仓位分配多少 USDT"的地方。Strategy 只给出选股 + 方向，Execution 只负责用 `mid_price` 把 USDT 换成合约张数，中间的 sizing 逻辑集中在 Risk。
+
+**V1 Sprint 1–3 — 硬编码 stub**：
+
+```python
+PLACEHOLDER_NOTIONAL_USDT = 100.0  # risk_service/service.py
+
+def _size_positions(self, signals):
+    return [
+        SizedPosition(
+            symbol=s.symbol, side=s.side,
+            notional_usdt=PLACEHOLDER_NOTIONAL_USDT,  # 每个仓位固定 100 USDT
+            signal_value=s.signal_value, reason=s.reason,
+        )
+        for s in signals
+    ]
+```
+
+`sizing_metadata.sizing_scheme` 恒为 `"hardcoded_placeholder"`，`per_position_notional_usdt = 100.0`。这一阶段的目的是让 strategy → risk → execution 的**事件链和 schema** 先走通，真实 sizing 推迟到 Sprint 4。
+
+**V1 Sprint 4 — 计划实装**：
+
+1. 读 `quant:account:balance`（`total_equity` 或 `available_balance`，二选一，`equity_source` yaml 字段）。
+2. 按 `sizing_scheme` 决定每仓名义金额：
+   - `equal_notional`：`base_notional = target_gross_exposure × base_equity / n`
+   - `signal_proportional`：按 `|signal_value|` 归一化后分配
+   - `vol_target`：按目标波动率反比缩放
+3. 应用 `max_position_notional_usdt` cap（单仓上限）。
+4. 五个 `_check_*` 组合级检查（max_position / total_exposure / drawdown / reserve / turnover）基于 `SizedPortfolio` 做最后一道 gate；任意失败则 emit `risk_rejected`。
+
+**Sprint 4 预期 yaml 扩展**：
 
 ```yaml
-max_position_pct: 0.15        # 单币种最大仓位占比
-max_total_exposure: 1.0       # 最大总敞口 (|多头| + |空头|)
-max_drawdown_halt: 0.30       # 触发暂停交易的最大回撤
-min_balance_reserve: 100      # 最低保留余额 (USDT)
-max_order_value: 5000         # 单笔订单最大金额 (USDT)
-max_daily_turnover: 3.0       # 每日最大换手率
-blacklist: []                 # 禁止交易的币种
+# risk.yaml (Sprint 4)
+enabled: true
+always_approve: false
+reject_symbols: []
+
+sizing_scheme: equal_notional           # equal_notional | signal_proportional | vol_target
+equity_source: total_equity             # total_equity | available_balance
+target_gross_exposure: 1.0              # |long| + |short| 名义 占 base_equity 的比例
+max_position_notional_usdt: null        # 单仓 USDT 上限；null = 不限制
+
+# 组合级检查（Sprint 4 实装）
+max_drawdown_halt: 0.30
+min_balance_reserve: 100
+max_daily_turnover: 3.0
 ```
+
+> **当前实现**：`risk.yaml` 只含 `enabled / always_approve / reject_symbols` 三个字段，不引入半成品的 sizing 配置；`PLACEHOLDER_NOTIONAL_USDT` 是模块常量，Sprint 4 同步引入完整 sizing yaml schema 时一起替换。
 
 #### 2.2.9 Execution Service (新增 — 执行质量网关)
 
@@ -787,7 +857,7 @@ RiskService 只做**组合级**可行性检查（敞口、回撤、余额），�
 | **订阅事件** | `risk_approved`（原本由 OrderService 订阅，现改由 ExecutionService 接手）|
 | **发布事件** | `execution_approved` 或 `execution_rejected` |
 | **数据输入** | Redis String `quant:orderbook:{symbol}`（由 DataService 覆盖写入的最新 L2 订单簿快照）+ Redis `quant:account:*`（组合预算状态）|
-| **核心逻辑** | 对 `target_portfolio` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过才 emit `execution_approved`；任一未通过则按 all-or-nothing 语义 emit `execution_rejected` |
+| **核心逻辑** | 对 `sized_portfolio` 中每个 `SizedPosition` 先用 `mid_price` 把 `notional_usdt` 折算成合约张数，再做**滑点 / 深度 / 预算** 三项检查，全部通过才 emit `execution_approved`；任一未通过则按 all-or-nothing 语义 emit `execution_rejected` |
 | **关键约束** | **不持有任何 WebSocket**、**不直接调用交易所**，仅读 Redis；ExecutionService 崩溃后可从空状态快速恢复，不依赖任何本地缓存 |
 | **配置文件** | `yamls/execution_config.yaml` |
 | **与 RiskService 的职责边界** | RiskService = **组合级** 可行性（max_position_pct / max_total_exposure / max_drawdown / min_balance_reserve / max_daily_turnover）; ExecutionService = **订单级** 可执行性（slippage / depth / single+portfolio budget）|
@@ -804,12 +874,19 @@ RiskService 只做**组合级**可行性检查（敞口、回撤、余额），�
 
 ```python
 class ExecutionService:
-    """从 risk_approved 消费，逐单做质量检查，全部通过才 emit execution_approved。"""
+    """从 risk_approved 消费，逐单做质量检查，全部通过才 emit execution_approved。
+
+    输入 SizedPortfolio 中的每个 SizedPosition 只含 `notional_usdt`（USDT 名义金额，
+    始终为正）+ `side`。ExecutionService 读 `quant:orderbook:{symbol}.mid_price`
+    把 USDT 换成合约张数，再做滑点 / 深度 / 预算检查。
+    """
 
     async def on_risk_approved(self, event: RiskApprovedEvent) -> None:
-        target_portfolio = event.target_portfolio
+        sized_portfolio = event.sized_portfolio
         current_positions = await self.account_reader.load_positions()
-        deltas = compute_deltas(target_portfolio, current_positions)
+        # compute_deltas 现在对比 SizedPosition.notional_usdt 和当前持仓名义金额，
+        # 产出 (symbol, side, delta_notional_usdt) 三元组
+        deltas = compute_deltas(sized_portfolio, current_positions)
 
         approved: list[CheckedOrder] = []
         rejected: list[CheckedOrder] = []
@@ -823,23 +900,28 @@ class ExecutionService:
                 rejected.append(CheckedOrder(delta, reasons=["stale_or_missing_book"]))
                 continue
 
+            # USDT → 合约张数：只在这里做一次除法
+            amount = delta.delta_notional_usdt / orderbook.mid_price
+
             slippage_ok, slippage_bps = estimate_slippage(
-                delta.side, delta.amount, orderbook, self.cfg.max_slippage_bps
+                delta.side, amount, orderbook, self.cfg.max_slippage_bps
             )
             depth_ok = check_depth(
-                delta.side, delta.amount, orderbook, self.cfg.min_depth_ratio
+                delta.side, amount, orderbook, self.cfg.min_depth_ratio
             )
-            order_value = delta.amount * orderbook.mid_price
+            # 预算检查直接用 notional_usdt，避免二次乘除
             budget_ok = check_budget(
-                order_value,
+                delta.delta_notional_usdt,
                 self.cfg.single_order_max_usdt,
                 portfolio_used_usdt,
                 self.cfg.portfolio_budget_max_usdt,
             )
 
             if slippage_ok and depth_ok and budget_ok:
-                approved.append(CheckedOrder(delta, est_slippage_bps=slippage_bps))
-                portfolio_used_usdt += order_value
+                approved.append(CheckedOrder(
+                    delta, amount=amount, est_slippage_bps=slippage_bps,
+                ))
+                portfolio_used_usdt += delta.delta_notional_usdt
             else:
                 reasons = []
                 if not slippage_ok:
@@ -847,7 +929,7 @@ class ExecutionService:
                 if not depth_ok:
                     reasons.append(("depth", None))
                 if not budget_ok:
-                    reasons.append(("budget", order_value))
+                    reasons.append(("budget", delta.delta_notional_usdt))
                 rejected.append(CheckedOrder(delta, reasons=reasons))
 
         # V1 采用 all-or-nothing 语义：任一拒绝则整批拒绝
@@ -1049,7 +1131,8 @@ for date in all_trading_dates:
 | `quant:account:orders` | String (JSON) | 活跃挂单快照 |
 | `quant:positions` | String (JSON) | 策略当前仓位 |
 | `quant:portfolio:snapshot` | String (JSON) | NAV / PnL / 回撤等组合指标快照 |
-| `quant:signal:latest` | String (JSON) | 最新策略信号 |
+| `quant:signal:latest` | String (JSON) | 最新策略信号快照（`StrategySignalBatch`，**不含** sizing） |
+| `quant:risk:latest` | String (JSON) | 最新风控后的目标组合（`SizedPortfolio`，USDT 名义金额） |
 | `quant:heartbeat:{service}` | String (JSON + TTL) | 服务心跳 |
 | `quant:state:{service}:last_run` | String | 上次执行时间戳 |
 | `quant:state:{service}:status` | String | 服务状态 (running / idle / error) |
@@ -1533,17 +1616,30 @@ parameters:
 cron_enabled: true
 cron_schedule: "59 23 * * *"    # 每日 23:59 UTC (same_day 模式)
 ```
-### risk_config.yaml
+### risk.yaml
+
+**V1 Sprint 1–3（当前实现）**：
 
 ```yaml
-max_position_pct: 0.15
-max_total_exposure: 1.0
+enabled: true
+always_approve: false
+reject_symbols: []
+```
+
+RiskService 当前只做 `reject_symbols` 过滤 + 硬编码 sizing（`PLACEHOLDER_NOTIONAL_USDT = 100.0`）。完整的 sizing 配置和组合级风控规则将在 Sprint 4 同步引入：
+
+```yaml
+# Sprint 4 规划（尚未实装）
+sizing_scheme: equal_notional           # equal_notional | signal_proportional | vol_target
+equity_source: total_equity             # total_equity | available_balance
+target_gross_exposure: 1.0
+max_position_notional_usdt: null        # 单仓 USDT 上限；null = 不限制
+
 max_drawdown_halt: 0.30
 min_balance_reserve: 100.0
-max_order_value: 5000.0
 max_daily_turnover: 3.0
 blacklist: []
-dry_run: true                   # 模拟盘默认 true
+dry_run: true
 ```
 
 ### execution_config.yaml
