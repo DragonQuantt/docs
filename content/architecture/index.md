@@ -93,13 +93,13 @@ class BaseStrategy(ABC):
     def generate_signal(
         self,
         features: Dict[str, FeatureVector],
-        current_positions: Dict[str, float],
         timestamp: datetime,
     ) -> StrategySignalBatch:
         """输入特征 → 输出选股 + 方向（**不含仓位大小**）。
 
         Sizing（每仓 USDT 名义金额）由 RiskService 负责计算；策略只回答
-        "买什么 / 买不买 / 做多还是做空"。
+        "买什么 / 买不买 / 做多还是做空"。策略是**无状态**的：不接收当前持仓，
+        hysteresis / turnover 控制一律由 RiskService 或 ExecutionService 处理。
         """
 
     def should_skip_rebalance(
@@ -155,7 +155,7 @@ class Rev1dStrategy(BaseStrategy):
         self.long_n = long_n
         self.short_n = short_n
 
-    def generate_signal(self, features, current_positions, timestamp):
+    def generate_signal(self, features, timestamp):
         scores = {}
         for symbol, feat in features.items():
             z1d = feat.get("zscore_neg_ret_1d")
@@ -187,7 +187,7 @@ class Rev1dStrategy(BaseStrategy):
         )
 ```
 
-注意示例中**没有 `weight` 计算**——仓位大小在 RiskService 阶段决定。
+注意示例中**没有 `weight` 计算**、**也没有 `current_positions` 参数**——仓位大小在 RiskService 阶段决定，策略本身是无状态的纯函数。
 
 **策略汇总表 (strategy_1 / strategy_4 / strategy_3):**
 
@@ -678,7 +678,7 @@ class Ofi14dStrategy(BaseStrategy):
         self.short_n = short_n
         self.min_candidates = min_candidates
 
-    def generate_signal(self, features, current_positions, timestamp):
+    def generate_signal(self, features, timestamp):
         scores = {}
         for symbol, feat in features.items():
             ofi_14d_value = feat.get("ofi_14d")
@@ -745,7 +745,7 @@ class StrategyService:
 
             pool_symbols = self._load_pool(strategy.pool_name)
             filtered_features = {s: features[s] for s in pool_symbols if s in features}
-            target = strategy.generate_signal(filtered_features, self.current_positions, timestamp)
+            target = strategy.generate_signal(filtered_features, timestamp)
             self.emit_signal(target)
 ```
 
@@ -1020,11 +1020,15 @@ rejection_policy: all_or_nothing     # V1 推荐：任一拒绝则整批拒绝�
 | **新增** | `position_differ.py` (差量计算), `order_executor.py` (重试 + 精度) |
 | **Dry-run** | 配置 `dry_run: true` 时只记录不实际下单 |
 
-**差量计算逻辑:**
+**差量计算逻辑（已前移到 ExecutionService）:**
 
 ```
-target_positions (来自 StrategyService)
-    - current_positions (来自 AccountService via Redis)
+sized_portfolio.positions[].notional_usdt   (来自 RiskService via quant:risk:latest)
+    ÷ orderbook.mid_price                   (来自 DataService via quant:orderbook:{symbol})
+    = target_contracts (目标合约张数)
+
+target_contracts
+    - current_contracts                     (来自 AccountService via quant:account:positions)
     = delta_orders (需要执行的订单列表)
 
 对每个 delta_order:
@@ -1032,6 +1036,8 @@ target_positions (来自 StrategyService)
     if delta < 0: sell
     if delta ≈ 0: skip (低于最小下单量)
 ```
+
+> **职责切分**：Strategy 不再接收 `current_positions`；差量计算在下游的 ExecutionService 完成（Sprint 4），OrderService 只负责下单执行。
 
 #### 2.2.11 Account Service (新增)
 
