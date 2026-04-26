@@ -672,6 +672,8 @@ V1 所需的全部 Redis 键:
 | `quant:features:latest:{symbol}` | String (JSON) | 最新特征快照 | FeatureService |
 | `quant:signal:latest` | String (JSON) | 最新策略信号快照（StrategySignalBatch，**不含** sizing） | StrategyService |
 | `quant:risk:latest` | String (JSON) | 最新风控后的目标组合（SizedPortfolio，USDT 名义金额） | RiskService |
+| `quant:strategy:state:crypto_pairs_mean_reversion` | String (JSON) | crypto pairs 运行时状态（pair position、bars_in_trade、active segment） | StrategyService |
+| `quant:strategy:crypto_pairs:segments` | String (JSON) | 导入的 frozen pair segment 快照 | StrategyService |
 | `quant:account:balance` | String (JSON) | 账户余额快照 | AccountService |
 | `quant:account:positions` | String (JSON) | 当前持仓快照 | AccountService |
 | `quant:account:orders` | String (JSON) | 活跃挂单快照 | AccountService |
@@ -723,6 +725,30 @@ V1 所需的全部 Redis 键:
   }
 }
 ```
+
+**Pair spread 信号 metadata 扩展**:
+
+`crypto_pairs_mean_reversion` 仍写入 `quant:signal:latest`，但每条腿会增加 `metadata`，供 RiskService 做 pair sizing：
+
+```json
+{
+  "symbol": "BTC/USDT",
+  "side": "long",
+  "signal_value": 1.0,
+  "reason": "crypto_pairs_1h:BTCUSDT-ETHUSDT_y",
+  "metadata": {
+    "strategy_type": "pair_spread",
+    "pair_id": "1h:BTCUSDT-ETHUSDT",
+    "leg": "y",
+    "target_state": 1,
+    "hedge_ratio": 1.25,
+    "leg_notional_multiplier": 1.0,
+    "freq": "1h"
+  }
+}
+```
+
+旧策略不带 `metadata` 时仍按原 V1 契约处理。
 
 **`quant:risk:latest`**（RiskService 写入，USDT 名义金额；结构与 `quant:risk_approved` 事件载荷一致）:
 

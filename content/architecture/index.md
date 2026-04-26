@@ -1139,6 +1139,8 @@ for date in all_trading_dates:
 | `quant:portfolio:snapshot` | String (JSON) | NAV / PnL / 回撤等组合指标快照 |
 | `quant:signal:latest` | String (JSON) | 最新策略信号快照（`StrategySignalBatch`，**不含** sizing） |
 | `quant:risk:latest` | String (JSON) | 最新风控后的目标组合（`SizedPortfolio`，USDT 名义金额） |
+| `quant:strategy:state:crypto_pairs_mean_reversion` | String (JSON) | crypto pairs 事件驱动策略运行时状态 |
+| `quant:strategy:crypto_pairs:segments` | String (JSON) | 导入的 frozen pair segment 快照 |
 | `quant:heartbeat:{service}` | String (JSON + TTL) | 服务心跳 |
 | `quant:state:{service}:last_run` | String | 上次执行时间戳 |
 | `quant:state:{service}:status` | String | 服务状态 (running / idle / error) |
@@ -1491,26 +1493,27 @@ async def consume_trades(self, symbol: str):
 
 ## 附录 A: 策略兼容性矩阵 {#appendix-a}
 
-本架构同时兼容 strategy_4 (rev_1d)、strategy_1 (Top 10 多因子) 和 strategy_3 (ofi_14d):
+本架构同时兼容 strategy_4 (rev_1d)、strategy_1 (Top 10 多因子)、strategy_3 (ofi_14d) 和 `crypto_pairs_mean_reversion`:
 
-| 数据/特征需求 | strategy_4 (rev_1d) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | 提供服务 |
-|-------------|:---:|:---:|:---:|------|
-| 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | AssetPoolService → Redis SET |
-| 月度流动性池 (T50) | ❌ | ❌ | ✅ | AssetPoolService → Redis SET |
-| Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | DataService → Redis Stream |
-| Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | BarSourceAdapterService |
-| Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | BarSourceAdapterService |
-| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | BarSourceAdapterService |
-| 日内 ret (1d) | ✅ | ✅ | ❌ | FeatureService |
-| 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
-| 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | FeatureService (扩展) |
-| Z-Score 标准化 | ✅ | ✅ | ✅ (截面) | FeatureService |
-| 历史长度过滤 (≥60 天) | ❌ | ❌ | ✅ | AssetPoolService / StrategyService |
-| 灵活换仓周期 | R1 | R1 | R14 | StrategyService |
-| 多策略并行 | 单策略 | 多策略集成 | 可独立或集成 | StrategyService |
-| 风控检查 (组合级) | ✅ | ✅ | ✅ | RiskService |
-| 滑点 / 深度 / 预算检查 (订单级) | ✅ | ✅ | ✅ | ExecutionService |
-| 市价单执行 | ✅ | ✅ | ✅ | OrderService |
+| 数据/特征需求 | strategy_4 (rev_1d) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | crypto_pairs_mean_reversion | 提供服务 |
+|-------------|:---:|:---:|:---:|:---:|------|
+| 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | frozen pair symbol union | AssetPoolService → Redis SET |
+| 月度流动性池 (T50) | ❌ | ❌ | ✅ | ❌ | AssetPoolService → Redis SET |
+| Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | ✅ | DataService → Redis Stream |
+| Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | ❌ | BarSourceAdapterService |
+| Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | ✅ (1m → 策略内 resample) | BarSourceAdapterService |
+| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | ❌ | BarSourceAdapterService |
+| 日内 ret (1d) | ✅ | ✅ | ❌ | ❌ | FeatureService |
+| close passthrough | ❌ | ❌ | ❌ | ✅ | FeatureService |
+| 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | ❌ | FeatureService (扩展) |
+| 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | ❌ | FeatureService (扩展) |
+| Z-Score 标准化 | ✅ | ✅ | ✅ (截面) | spread z-score (strategy) | FeatureService / StrategyService |
+| 历史长度过滤 (≥60 天) | ❌ | ❌ | ✅ | 离线 research import | AssetPoolService / StrategyService |
+| 灵活换仓周期 | R1 | R1 | R14 | event-driven pair spread | StrategyService |
+| 多策略并行 | 单策略 | 多策略集成 | 可独立或集成 | 单策略 dry-run ready | StrategyService |
+| 风控检查 (组合级) | ✅ | ✅ | ✅ | pair leg sizing | RiskService |
+| 滑点 / 深度 / 预算检查 (订单级) | ✅ | ✅ | ✅ | ✅ | ExecutionService |
+| 市价单执行 | ✅ | ✅ | ✅ | 暂不启用真实下单 | OrderService |
 
 **分阶段实施:**
 
@@ -1519,6 +1522,7 @@ async def consume_trades(self, symbol: str):
 | **V1 Sprint 1** (最短闭环) | strategy_4 (rev_1d) | Data + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order（dry-run）|
 | **V1 Sprint 4** (执行可靠性) | 同上 | 上一行 + **ExecutionService**（插入 Risk 与 Order 之间做滑点/深度/预算检查）|
 | **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
+| **Pairs dry-run** | crypto_pairs_mean_reversion | Data + AssetPool + BarSourceAdapterService(1m time_bar) + Feature(close passthrough) + Strategy(event-driven) + Risk(pair sizing) + Execution(depth check) |
 | **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapterService tick 特征启用 + 多策略集成 |
 
 ## 附录 B: Terraform 模块清单 {#appendix-b}
@@ -1692,6 +1696,4 @@ webhook:
   url: ""                       # Telegram Bot API URL
   channel_id: ""                # Telegram Chat ID
 ```
-
-
 
