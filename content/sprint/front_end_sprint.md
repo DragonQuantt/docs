@@ -40,6 +40,25 @@ V2 FE Sprint 1         V2 FE Sprint 2
 
 ---
 
+## Phase A 前端范围（2026-06 插入）
+
+> 后端 `feat/crypto_pairs_strategy` 分支即将实施 **Phase A**: 月度轮动策略 `monthly_majors_vs_alts` + 已实现 crypto pairs 策略的真实交易闭环。前端定位为**审计型监控**（非盯盘型）: 每次调仓可逐腿复盘、调仓间漂移可见、报警能到手机（Telegram 为主通道，仪表盘为详情查看处）、30 秒内可人工停止。
+> Phase A 大致对应原 **V1 FE Sprint 1 + Sprint 2 的子集**（映射见本节末），下方原 Sprint 计划保留作为长期蓝图。
+
+1. **五个现有页面从 mock 接真数据**:
+   - Dashboard: 实时 NAV（复用已实现的 portfolio WS `/api/v1/account/portfolio/ws`）、下次调仓倒计时、上次调仓结果徽章、服务心跳灯
+   - Positions: 目标 vs 实际权重偏差高亮 + 每仓累计 funding
+   - PnL: NAV/回撤 + majors 腿 vs alts 腿归因拆分
+   - Risk: 报警历史（30s 轮询）
+   - System: 心跳卡片 + 下次调仓时间
+2. **新增 RebalanceView 调仓审计页**（orders feature 内）: 按 `rebalance_id` 时间线展示 信号权重 → sizing 结果 → 执行校验 → 逐单成交（滑点 vs 信号时 mid、手续费）→ before/after 权重对比表；数据源 `GET /api/v1/orders/rebalance-history`（列表）与按 id 详情（规格见 `../frontend/01_api_design.md`）
+3. **顶栏全局元素**: 急停按钮（二次确认弹窗 → `POST /api/v1/system/emergency-stop`）+ 环境徽章（`dry_run` / `testnet` / `live` 醒目显示）+ 策略级启停开关（strategy 页内，写 `quant:strategy:enabled:{name}`）
+4. **WebSocket 范围收缩**: Phase A 只复用已实现的 portfolio WS，不新建 alerts/signals WS（报警实时性由 Telegram 推送承担，页面轮询足够）；Signals / Backtest 页维持 mock 留给后续
+
+**与原 Sprint 的对应**: 第 1、3 项 ≈ FE Sprint 1（核心可观测性）+ FE Sprint 2 的风控面板/告警历史/急停部分；第 2 项 ≈ FE Sprint 2 订单审计页的深化（换仓事件汇总 → 按 `rebalance_id` 逐腿审计）；第 4 项是对 Sprint 1-2 中 WS 任务（`/ws/services`、`/ws/alerts`）的收缩。波动率/信号覆盖率/回测（Sprint 3）与策略参数管理（V2）不在 Phase A 内。
+
+---
+
 ## 前后端对齐矩阵
 
 | 前端 Sprint | 版本 | 依赖后端 Sprint | 对齐 API 版本 | 核心页面 |

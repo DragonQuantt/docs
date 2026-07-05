@@ -958,6 +958,96 @@ NAV 净值曲线。
 }
 ```
 
+#### RebalanceView 调仓审计页规格（【Phase A 计划】新增页面）
+
+新增于 orders feature 内（路由建议 `/orders/rebalance/:rebalanceId`），按 `rebalance_id` 对一次调仓做逐腿审计复盘——这是 Phase A "审计型监控" 的核心页面。
+
+**布局要点（自上而下时间线）**:
+
+1. **信号权重** — 策略输出的目标权重（majors 腿 / alts 腿分组展示）
+2. **sizing 结果** — RiskService 折算后的 USDT notional / 合约数
+3. **执行校验** — ExecutionService 订单簿深度/时效校验结论（通过/拒绝及原因）
+4. **逐单成交** — 每张订单的滑点（成交均价 vs 信号时 mid）与手续费
+5. **before/after 权重对比表** — 调仓前 / 目标 / 调仓后实际权重 + 偏差
+
+**数据接口**:
+
+- 列表: `GET /api/v1/orders/rebalance-history`（见上）
+- 详情: `GET /api/v1/orders/rebalance-history/{rebalance_id}`（见下）
+
+#### GET /api/v1/orders/rebalance-history/{rebalance_id}
+
+单次调仓审计详情（RebalanceView 主数据源，【Phase A 计划】）。
+
+**数据来源**: `signal_records` + `rebalance_records` 表（见 `INTEGRATION_PLAN.md` Phase 1 Step 1.3 的 `before_weights` / `target_weights` / `after_weights` / `execution_summary` 字段）+ 订单成交持久化（OrderService 为 Phase A 余项）
+
+**响应**:
+
+```json
+{
+  "data": {
+    "rebalance_id": "rb-20260701-001",
+    "strategy_name": "monthly_majors_vs_alts",
+    "timestamp": "2026-07-01T00:05:00Z",
+    "signal": {
+      "signal_time": "2026-07-01T00:00:00Z",
+      "target_weights": {
+        "BTC/USDT:USDT": 0.25,
+        "ETH/USDT:USDT": 0.25,
+        "DOGE/USDT:USDT": -0.10
+      }
+    },
+    "sizing": {
+      "equity_base": 10234.56,
+      "positions": [
+        {
+          "symbol": "BTC/USDT:USDT",
+          "target_weight": 0.25,
+          "notional_usdt": 2558.64,
+          "contracts": 0.041
+        }
+      ]
+    },
+    "execution_check": {
+      "status": "approved",
+      "checked_at": "2026-07-01T00:05:02Z",
+      "detail": "orderbook depth ok, staleness 800ms < 5000ms"
+    },
+    "fills": [
+      {
+        "order_id": "ord-20260701-001",
+        "symbol": "BTC/USDT:USDT",
+        "side": "buy",
+        "amount": 0.041,
+        "avg_fill_price": 62500.00,
+        "mid_at_signal": 62450.00,
+        "slippage_bps": 8.0,
+        "fee": 1.28,
+        "fee_currency": "USDT",
+        "status": "filled"
+      }
+    ],
+    "weights_comparison": [
+      {
+        "symbol": "BTC/USDT:USDT",
+        "before_weight": 0.0,
+        "target_weight": 0.25,
+        "after_weight": 0.249,
+        "deviation": -0.001
+      }
+    ],
+    "summary": {
+      "orders_total": 8,
+      "orders_filled": 8,
+      "fee_total": 6.40,
+      "avg_slippage_bps": 7.2
+    }
+  }
+}
+```
+
+字段说明: `slippage_bps` = (成交均价 − 信号时 mid) / 信号时 mid × 10000（按方向取号）；`fee` 为单笔手续费，`fee_total` 为本次调仓合计；`before_weight` / `after_weight` 来自 `rebalance_records` 表。
+
 #### GET /api/v1/orders/trades
 
 成交明细 (分页)。
@@ -1226,6 +1316,14 @@ NAV 净值曲线。
 ---
 
 ## 三、WebSocket API {#websocket-api}
+
+### 3.0 Phase A 范围说明（2026-06 补充）
+
+Phase A **只复用已实现的 portfolio 实时推送**，不新建任何 WS 端点:
+
+- 【当前实现】`WS /api/v1/account/portfolio/ws`（本章 `/ws/portfolio` 设计在代码中的实际落地路径），Dashboard 实时 NAV 数据源；`WS /api/v1/account/position/ws` 同已实现，可按需复用
+- 【不建】`/ws/alerts`、`/ws/signals`: 月频策略无需盯盘级实时性，**报警实时性由 Telegram 推送承担**，仪表盘作为详情查看处，页面 30s 轮询 `GET /api/v1/risk/alerts` 足够
+- 本章其余 WS 端点（`/ws/positions`、`/ws/services` 等）保留为后续设计；Signals / Backtest 页 Phase A 维持 mock
 
 ### 3.1 通用协议
 

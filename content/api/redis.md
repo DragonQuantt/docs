@@ -1,1221 +1,259 @@
-# Redis 事件总线（内部通信）参考
+# Redis 事件总线（内部通信）
 
-本页定义服务间内部通信契约，作为 HTTP / WebSocket 外部 API 的补充。
-
-- **面向后端服务之间通信**（Strategy / Risk / Order / Account / Monitor / Feature）。
-- **不面向浏览器前端直连**。前端对接仍以 [HTTP API](http.md) / [WebSocket API](websocket.md) 为准。
-
-版本说明：
-
-| 版本 | 覆盖策略 | 数据链路 |
-|------|---------|---------|
-| **V1 (MVP)** | strategy_2 (baseline_rev) | AssetPool → DirectKline → Feature → Strategy → Risk → Order → Account |
-| **V2** | + strategy_1 (Top 10 多因子) + strategy_3 (ofi_14d) | 新增 DataIngestion → DollarBar → TickFeature → BarSourceAdapterService；多策略并行 |
-
----
+> 服务间内部通信契约。命名空间约定与模块职责以 [架构文档](../architecture/index.md) 为准；本文定义频道与键的载荷。
+>
+> **核心约定（账户作用域）**：每个策略一条竖直栈，绑一个账户。所有**业务**频道/键带账户前缀 `quant:{account}:<逻辑名>`；**公共行情**键全局共享。前缀由 Keyspace 模块统一注入，服务只说逻辑名。下文用 `{account}` 占位（如 `acctA`/`acctB`）。
 
 ## 一、通信分层
 
-### 1) Redis Pub/Sub（低频业务事件）
-
-- 典型场景：`signal_generated`、`risk_approved`、`risk_rejected`。
-- 语义：`at-most-once`（订阅者不在线时可能丢消息）。
-- 用法：实时触发主流程。
-
-### 2) Redis Streams（高频数据流） [V2]
-
-- 典型场景：`aggTrades` 高频数据。
-- 语义：`at-least-once`（消费者组 + ACK）。
-- 用法：高吞吐数据管线与短期回放。
-
----
+| 层 | 机制 | 语义 | 用途 |
+|----|------|------|------|
+| 低频业务事件 | Redis Pub/Sub | at-most-once（+ 定时兜底） | `signal_generated` / `risk_approved` / `execution_approved` … |
+| 高频公共行情 | Redis Streams | at-least-once（消费者组 + ACK） | `market:trades`（策略 6 消费者组） |
 
 ## 二、统一消息外壳
 
-所有 Pub/Sub 消息采用统一 JSON 外壳：
+所有 Pub/Sub 消息：
 
 ```json
 {
   "event_type": "signal_generated",
   "source_service": "strategy_service",
-  "timestamp": "2026-03-02T23:59:00Z",
-  "trace_id": "trc-20260302-0001",
+  "account": "acctA",
+  "timestamp": "2026-06-13T00:10:00Z",
+  "trace_id": "trc-acctA-20260613-0001",
   "data": { }
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `event_type` | string | 是 | 事件类型，与通道语义一致 |
-| `source_service` | string | 是 | 事件生产者服务名 |
-| `timestamp` | string (ISO 8601) | 是 | 事件产生时间 (UTC) |
-| `trace_id` | string | 推荐 | 跨服务追踪 ID，格式 `trc-{YYYYMMDD}-{seq}` |
-| `data` | object | 是 | 事件业务载荷（各事件 Schema 见下文） |
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `event_type` | 是 | 事件类型 |
+| `source_service` | 是 | 生产者服务名 |
+| `account` | 是 | 所属账户/栈标识（与频道前缀一致） |
+| `timestamp` | 是 | ISO 8601 UTC |
+| `trace_id` | 推荐 | 跨服务追踪 ID |
+| `data` | 是 | 业务载荷（见下文） |
 
----
-
-## 三、V1 Pub/Sub 通道契约
-
-V1 共 11 个通道，覆盖 strategy_2 (baseline_rev) 的完整交易闭环。
-
-> **说明**：`quant:execution_approved` 与 `quant:execution_rejected` 由 ExecutionService 发布，**在 V1 Sprint 4 "风控前置与执行可靠性" 引入**。V1 Sprint 1 最短闭环阶段允许 OrderService 直接订阅 `quant:risk_approved`；Sprint 4 后必须经 ExecutionService 接管。
-
-### 3.1 通道总览
+## 三、频道契约（单栈，频道名均 `quant:{account}:<名>`）
 
 ```mermaid
 flowchart LR
-    AssetPool["AssetPoolService"] -->|asset_pool_updated| Aggregator["AggregatorService"]
-    Aggregator -->|kline_aggregated| Feature["FeatureService"]
-    Feature -->|feature_calculated| Strategy["StrategyService"]
-    Strategy -->|signal_generated| Risk["RiskService"]
-    Risk -->|risk_approved| Execution["ExecutionService"]
-    Risk -.->|risk_rejected| Monitor["MonitorService"]
-    Execution -->|execution_approved| Order["OrderService"]
-    Execution -.->|execution_rejected| Monitor
-    Order -->|order_executed| Account["AccountService"]
-    Order -.->|order_failed| Monitor
-    Account -->|account_updated| Risk
+    Strategy -->|signal_generated| Risk
+    Risk -->|risk_approved| Execution
+    Risk -.->|risk_rejected| Alert
+    Execution -->|execution_approved| Order
+    Execution -.->|execution_rejected| Alert
+    Order -->|order_executed| Account
+    Order -.->|order_failed| Alert
+    Order -->|order_rebalanced| Account
+    Account -->|account_updated| Gateway["API 网关 WS 推送"]
 ```
 
-| 通道 | 发布者 | 订阅者 | 频率 |
-|------|--------|--------|------|
-| `quant:asset_pool_updated` | AssetPoolService | AggregatorService | 每 24h |
-| `quant:kline_aggregated` | AggregatorService | FeatureService | 每根 K 线 |
-| `quant:feature_calculated` | FeatureService | StrategyService | 每次特征更新 |
-| `quant:signal_generated` | StrategyService | RiskService | 每次换仓（R1: 每日 23:59 UTC） |
-| `quant:risk_approved` | RiskService | ExecutionService (Sprint 4+) / OrderService (Sprint 1-3) | 风控通过时 |
-| `quant:risk_rejected` | RiskService | MonitorService | 风控拒绝时 |
-| `quant:execution_approved` | ExecutionService | OrderService | 执行质量通过时（Sprint 4+）|
-| `quant:execution_rejected` | ExecutionService | MonitorService | 执行质量拒绝时（Sprint 4+）|
-| `quant:order_executed` | OrderService | AccountService, MonitorService | 每笔订单执行后 |
-| `quant:order_failed` | OrderService | MonitorService | 订单失败时 |
-| `quant:account_updated` | AccountService | RiskService | 每 30s 轮询后 |
+| 频道（去前缀） | 发布者 | 订阅者 |
+|----------------|--------|--------|
+| `signal_generated` | Strategy | Risk |
+| `risk_approved` | Risk | Execution |
+| `risk_rejected` | Risk | Alert |
+| `execution_approved` | Execution | Order |
+| `execution_rejected` | Execution | Alert |
+| `order_executed` | Order | Account |
+| `order_failed` | Order | Alert |
+| `order_rebalanced` | Order | Account |
+| `account_updated` | Account | API 网关 |
 
----
+公共（全局，无账户前缀）：`asset_pool_updated`（AssetPool → 仅 Monitor；下游直接读 SET）。
 
-### 3.2 `quant:asset_pool_updated`
+### 3.1 `signal_generated`
 
-资产池更新完成，下游服务刷新 symbol 列表。
+策略产出 **Target Portfolio**（完整目标组合，永不增量）交 Risk 做 sizing。
 
-**触发条件**: AssetPoolService 定时筛选完成（default 池每 24h）。
+**触发**：
 
-**`data` 载荷**:
+- **scheduler 策略（策略 5）**：每日 `rebalance_hour_utc:rebalance_minute_utc` 触发一次，发布完整目标组合（含「仅止损检查日」也发全量）。
+- **streaming 策略（策略 6）**：每根美元 bar 完成时发布完整目标组合（绝大多数 bar 与上次相同，下游差量折叠为 0 单）。
+
+**载荷**（`TargetPortfolio.to_dict()`）：
 
 ```json
 {
-  "exchange": "binance",
-  "pool_name": "default",
-  "symbols": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
-  "pool_size": 100,
-  "metric": "usdt_volume_30d",
-  "top_k": 100,
-  "updated_at": "2026-03-02T00:00:00Z"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `exchange` | string | 是 | 交易所标识 |
-| `pool_name` | string | 是 | 池名称。V1 固定 `"default"` |
-| `symbols` | string[] | 是 | 入选标的列表 (CCXT 统一格式) |
-| `pool_size` | int | 是 | 入选数量 |
-| `metric` | string | 是 | 筛选指标名 |
-| `top_k` | int | 是 | 目标 Top-K |
-| `updated_at` | string (ISO 8601) | 是 | 池更新完成时间 |
-
----
-
-### 3.3 `quant:kline_aggregated`
-
-K 线数据已聚合，可进行特征计算。
-
-**触发条件**: AggregatorService (DirectKline) 拉取新 K 线后。
-
-**`data` 载荷**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "timeframe": "1m",
-  "kline": {
-    "timestamp": "2026-03-02T23:58:00Z",
-    "open": 62400.00,
-    "high": 62500.00,
-    "low": 62380.00,
-    "close": 62450.00,
-    "volume": 12.345
-  },
-  "source": "direct_kline"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `symbol` | string | 是 | 交易对 |
-| `timeframe` | string | 是 | K 线周期，如 `"1m"`, `"5m"`, `"1h"` |
-| `kline.timestamp` | string (ISO 8601) | 是 | K 线开始时间 |
-| `kline.open` | float | 是 | 开盘价 |
-| `kline.high` | float | 是 | 最高价 |
-| `kline.low` | float | 是 | 最低价 |
-| `kline.close` | float | 是 | 收盘价 |
-| `kline.volume` | float | 是 | 成交量 |
-| `source` | string | 是 | 数据来源。V1 固定 `"direct_kline"` |
-
----
-
-### 3.4 `quant:feature_calculated`
-
-特征计算完成，策略服务可消费。
-
-**触发条件**: FeatureService 完成一轮特征计算。
-
-**`data` 载荷 (V1)**:
-
-```json
-{
-  "calculation_id": "fc-20260302-235900",
-  "calculation_time": "2026-03-02T23:59:00Z",
-  "pool_name": "default",
-  "features_version": "v1",
-  "symbols_count": 98,
-  "features": {
-    "BTC/USDT:USDT": {
-      "zscore_neg_ret_2h": 1.85,
-      "zscore_neg_ret_4h": 1.42,
-      "ret_2h": -0.0032,
-      "ret_4h": -0.0058
-    },
-    "ETH/USDT:USDT": {
-      "zscore_neg_ret_2h": -2.10,
-      "zscore_neg_ret_4h": -1.88,
-      "ret_2h": 0.0045,
-      "ret_4h": 0.0072
-    }
-  },
-  "missing_symbols": ["NEWTOKEN/USDT:USDT"]
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `calculation_id` | string | 是 | 本轮计算唯一 ID |
-| `calculation_time` | string (ISO 8601) | 是 | 计算完成时间 |
-| `pool_name` | string | 是 | 目标资产池 |
-| `features_version` | string | 是 | 特征版本标识。V1 = `"v1"` |
-| `symbols_count` | int | 是 | 成功计算特征的 symbol 数 |
-| `features` | object | 是 | symbol → 特征映射 (见下表) |
-| `missing_symbols` | string[] | 是 | 因数据不足未能计算的 symbol |
-
-**V1 特征字段 (strategy_2 baseline_rev 所需)**:
-
-| 特征名 | 类型 | 说明 |
-|--------|------|------|
-| `zscore_neg_ret_2h` | float \| null | 2h 收益的负向 z-score (window=30, negate=True)。跌 → 正值 → 做多 |
-| `zscore_neg_ret_4h` | float \| null | 4h 收益的负向 z-score (window=30, negate=True) |
-| `ret_2h` | float \| null | 原始 2h 收益率: `close(EOD) / close(EOD-2h) - 1` |
-| `ret_4h` | float \| null | 原始 4h 收益率: `close(EOD) / close(EOD-4h) - 1` |
-
----
-
-### 3.5 `quant:signal_generated`
-
-策略选股 + 方向生成完毕，交给 RiskService 做 sizing。
-
-**触发条件**: StrategyService 在换仓时点（baseline_rev: 每日 23:59 UTC）调用 `generate_signal()` 后。
-
-> **重要**：V1 重构后，策略**不再**在此事件里计算仓位大小。`data.signals[]` 只含 `symbol / side / signal_value / reason`，`weight` 字段已删除。仓位 USDT 名义金额由下游 RiskService 决定，详见 §3.6。
-
-**`data` 载荷**:
-
-```json
-{
-  "strategy_name": "baseline_rev",
-  "signal_timestamp": "2026-03-02T23:59:00Z",
-  "rebalance_id": "rb-20260302-001",
-  "mode": "single",
-  "pool_name": "default",
-  "signals": [
-    {
-      "symbol": "BTC/USDT:USDT",
-      "side": "long",
-      "signal_value": 1.85,
-      "reason": "baseline_rev_long"
-    },
-    {
-      "symbol": "DOGE/USDT:USDT",
-      "side": "short",
-      "signal_value": -2.10,
-      "reason": "baseline_rev_short"
-    }
+  "legs": [
+    { "symbol": "BTC/USDT:USDT", "side": "long",  "target_weight": 0.8034, "signal_value": 0.8034, "reason": "majors_long" },
+    { "symbol": "SOL/USDT:USDT", "side": "short", "target_weight": -0.1148, "signal_value": -0.1148, "reason": "alts_basket_short" }
   ],
-  "metadata": {
-    "n_candidates": 480,
-    "long_count": 30,
-    "short_count": 30,
-    "skipped": false,
-    "cross_section_std": 0.72,
-    "stale_symbols_count": 0
-  }
+  "strategy_name": "monthly_majors_vs_alts",
+  "signal_timestamp": "2026-06-13T00:10:00Z",
+  "signal_type": "target_weight",
+  "rebalance_id": "rb-monthly_majors_vs_alts-20260613T0010",
+  "metadata": { "leverage": 1.15, "realised_vol": 0.174, "is_rebalance_day": false, "basket_size": 100, "stopped": {} }
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `strategy_name` | string | 是 | 策略标识 |
-| `signal_timestamp` | string (ISO 8601) | 是 | 信号计算时间点 |
-| `rebalance_id` | string | 是 | 本次换仓唯一 ID |
-| `mode` | string | 是 | 策略模式。V1 固定 `"single"` |
-| `pool_name` | string | 是 | 使用的资产池 |
-| `signals` | StrategySignal[] | 是 | 策略选出的标的列表（**不含 sizing**） |
-| `metadata` | object | 是 | 调试信息（n_candidates / long_count / short_count / skipped / ...） |
+| 字段 | 说明 |
+|------|------|
+| `legs[]` | 完整目标组合（带符号 `target_weight`，**不含 USDT sizing**）。空仓批次 `legs: []` + metadata 带 `flat_reason` |
+| `signal_type` | `target_weight`（两策略统一）。仅当 sizing 语义真不同才引入新类型 |
+| `rebalance_id` | 确定性幂等键：scheduler = `rb-{strategy}-{计划触发时刻}`；streaming = `rb-{strategy}-{bar收盘时间戳}`。重试同 id |
+| `metadata` | 策略私有、原样透传（策略 5：`leverage`/`stopped`…；策略 6：`gate`/`cb_active`…） |
 
-**StrategySignal 结构**:
+同时覆盖写 `quant:{account}:signal:latest`。
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `symbol` | string | 是 | 交易对 |
-| `side` | string | 是 | `"long"` \| `"short"` |
-| `signal_value` | float | 是 | 原始信号值（例如 z-score） |
-| `reason` | string | 是 | 可读说明 |
+### 3.2 `risk_approved` / `risk_rejected`
 
----
+Risk 按账户权益 sizing：`notional_usdt = |target_weight| × equity`，equity 读 `quant:{account}:account:balance` 的 `total_equity`（缺失/超 `balance_max_age_seconds` 回退 `default_equity_usdt`）；低于 `min_notional_usdt` 剔腿；总名义超 `max_gross_exposure × equity` 等比缩减。
 
-### 3.6 `quant:risk_approved`
-
-风控完成 sizing，把每个仓位的 USDT 名义金额交给 ExecutionService。
-
-**触发条件**: RiskService 消费 `signal_generated`，按 `reject_symbols` 过滤后调用 `_size_positions` 打上 USDT 名义金额，组合级检查（Sprint 4）全部通过。
-
-**`data` 载荷**（= `SizedPortfolio.to_dict()` + 透传 `rebalance_id / mode / pool_name`）:
+**`risk_approved` 载荷**（`SizedPortfolio.to_dict()`，透传 `rebalance_id`/`signal_type`/`metadata`）：
 
 ```json
 {
-  "rebalance_id": "rb-20260302-001",
-  "mode": "single",
-  "pool_name": "default",
-  "strategy_name": "baseline_rev",
-  "signal_timestamp": "2026-03-02T23:59:00+00:00",
   "positions": [
-    {
-      "symbol": "BTC/USDT:USDT",
-      "side": "long",
-      "notional_usdt": 100.0,
-      "signal_value": 1.85,
-      "reason": "baseline_rev_long"
-    },
-    {
-      "symbol": "DOGE/USDT:USDT",
-      "side": "short",
-      "notional_usdt": 100.0,
-      "signal_value": -2.10,
-      "reason": "baseline_rev_short"
-    }
+    { "symbol": "BTC/USDT:USDT", "side": "long",  "notional_usdt": 840.0, "signal_value": 0.8034, "reason": "majors_long" },
+    { "symbol": "SOL/USDT:USDT", "side": "short", "notional_usdt": 114.8, "signal_value": -0.1148, "reason": "alts_basket_short" }
   ],
+  "strategy_name": "monthly_majors_vs_alts",
+  "signal_timestamp": "2026-06-13T00:10:00Z",
   "sizing_metadata": {
-    "sizing_scheme": "hardcoded_placeholder",
-    "per_position_notional_usdt": 100.0,
-    "total_notional_usdt": 6000.0,
-    "note": "Sprint 4 will replace this with equity-based sizing; current value is a fixed stub constant."
+    "sizing_scheme": "target_weight_equity",
+    "equity_usdt": 1000.0,
+    "equity_source": "account_balance",
+    "total_notional_usdt": 954.8
   },
-  "strategy_metadata": {
-    "n_candidates": 480,
-    "long_count": 30,
-    "short_count": 30,
-    "skipped": false,
-    "cross_section_std": 0.72,
-    "stale_symbols_count": 0
-  }
+  "strategy_metadata": { "leverage": 1.15, "is_rebalance_day": false },
+  "rebalance_id": "rb-monthly_majors_vs_alts-20260613T0010",
+  "signal_type": "target_weight"
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID（来自 signal_generated） |
-| `mode` | string | 是 | 策略模式，透传 |
-| `pool_name` | string | 是 | 资产池，透传 |
-| `strategy_name` | string | 是 | 策略名 |
-| `signal_timestamp` | string (ISO 8601) | 是 | 策略信号生成时间 |
-| `positions` | SizedPosition[] | 是 | 每个仓位的 USDT 名义金额列表 |
-| `sizing_metadata` | object | 是 | sizing 决策过程的输入和结果 |
-| `strategy_metadata` | object | 是 | 透传 `StrategySignalBatch.metadata` |
+`SizedPosition`：`notional_usdt` 始终为正，方向由 `side` 定。`sizing_metadata` 可选携带 `gross_scale_factor`（缩减系数）、`dropped_below_min_notional`（剔腿列表）。同时覆盖写 `quant:{account}:risk:latest`。
 
-**SizedPosition 结构**:
+**`risk_rejected` 载荷**（整批拒绝）：
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `symbol` | string | 是 | 交易对 |
-| `side` | string | 是 | `"long"` \| `"short"` |
-| `notional_usdt` | float | 是 | USDT 名义金额。**始终为正数**，方向由 `side` 决定 |
-| `signal_value` | float | 是 | 来自策略的原始信号值 |
-| `reason` | string | 是 | 可读说明（透传自 StrategySignal） |
+```json
+{ "strategy_name": "...", "rebalance_id": "...", "reason": "missing_target_weight", "detail": { "symbols": ["DOGE/USDT:USDT"] } }
+```
 
-**sizing_metadata 字段**（V1 Sprint 1–3 硬编码 stub 形态）:
+`reason` 枚举：`risk_service_disabled` | `missing_target_weight` | `emergency_stop` | `strategy_disabled`。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `sizing_scheme` | string | 当前恒为 `"hardcoded_placeholder"`；Sprint 4 扩展为 `equal_notional` / `signal_proportional` / `vol_target` |
-| `per_position_notional_usdt` | float | 每仓分配的 USDT 名义金额（stub: 100.0） |
-| `total_notional_usdt` | float | 所有仓位 notional 之和 |
-| `note` | string | 人读提示，说明当前是 stub，Sprint 4 会替换 |
+### 3.3 `execution_approved` / `execution_rejected`
 
-> **V1 Sprint 1–3（当前）**：`sizing_metadata.sizing_scheme == "hardcoded_placeholder"`，每仓固定 100 USDT，不读账户权益；Risk 不做任何组合级 gate，始终 emit `risk_approved`。
-> **V1 Sprint 4**：实装基于 `quant:account:balance` 的真实 sizing + 五项组合级检查（max_position / total_exposure / drawdown / reserve / turnover）。`sizing_metadata` 会扩展 `base_equity_usdt` / `equity_source` / `target_gross_usdt` / `cap_applied_count` 等字段。
-> **订阅方**：Sprint 1–3 允许 OrderService 直接订阅；Sprint 4 起统一由 ExecutionService 接手 → 做滑点/深度/预算检查后再 emit `execution_approved` 或 `execution_rejected`。
+Execution 订阅 `risk_approved`，读 `quant:orderbook:{symbol}`（全局键），逐腿做新鲜度 + 盘口深度校验，`notional/mid_price→contracts`。**逐腿独立**：通过的进 approved，不通过的进 rejected（不再整批否决）。
 
----
-
-### 3.6.1 `quant:execution_approved` [Sprint 4+]
-
-执行质量网关对 `risk_approved` 展开的每笔 delta order 做**滑点 / 深度 / 预算** 三项检查，全部通过后发布此事件，OrderService 消费后执行真实下单。
-
-**触发条件**: ExecutionService 消费 `quant:risk_approved`，用 `quant:orderbook:{symbol}.mid_price` 把每个 `SizedPosition.notional_usdt` 换算成合约张数（`amount = notional_usdt / mid_price`），对比当前持仓生成 delta orders，每一笔都通过三项检查。
-
-**`data` 载荷**:
+**`execution_approved` 载荷**：
 
 ```json
 {
-  "rebalance_id": "rb-20260302-001",
-  "strategy_name": "baseline_rev",
-  "approved_at": "2026-03-02T23:59:01Z",
-  "execution_check_summary": {
-    "total_orders": 60,
-    "approved_orders": 60,
-    "rejected_orders": 0,
-    "max_slippage_bps": { "threshold": 10, "actual_max": 7.2, "passed": true },
-    "min_depth_ratio": { "threshold": 3.0, "actual_min": 4.5, "passed": true },
-    "single_order_max_usdt": { "threshold": 5000, "actual_max": 4820.50, "passed": true },
-    "portfolio_budget_max_usdt": { "threshold": 50000, "actual": 42100.30, "passed": true }
-  },
-  "approved_orders": [
-    {
-      "symbol": "BTC/USDT:USDT",
-      "side": "buy",
-      "amount": 0.005,
-      "est_avg_price": 62458.30,
-      "est_order_value_usdt": 312.29,
-      "est_slippage_bps": 1.3,
-      "orderbook_snapshot_age_ms": 450
-    }
+  "rebalance_id": "rb-monthly_majors_vs_alts-20260613T0010",
+  "strategy_name": "monthly_majors_vs_alts",
+  "orders": [
+    { "symbol": "BTC/USDT:USDT", "side": "buy", "contracts": 0.013451, "notional_usdt": 840.0, "mid_price": 62450.0 }
   ]
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID（来自 `risk_approved`）|
-| `strategy_name` | string | 是 | 策略名 |
-| `approved_at` | string (ISO 8601) | 是 | 批准时间 |
-| `execution_check_summary` | object | 是 | 三项检查摘要 |
-| `execution_check_summary.total_orders` | int | 是 | 本次换仓涉及的 delta order 总数 |
-| `execution_check_summary.approved_orders` | int | 是 | 通过的 delta order 数 |
-| `execution_check_summary.rejected_orders` | int | 是 | 拒绝的 delta order 数（本事件中恒为 0）|
-| `execution_check_summary.{check_name}` | object | 是 | 每项检查的 `threshold / actual / passed` 摘要 |
-| `approved_orders` | object[] | 是 | 通过质量检查的 delta order 列表 |
-| `approved_orders[].symbol` | string | 是 | 交易对 |
-| `approved_orders[].side` | string | 是 | `"buy"` \| `"sell"` |
-| `approved_orders[].amount` | float | 是 | 订单量（基础币）|
-| `approved_orders[].est_avg_price` | float | 是 | 按订单簿逐档吃单估算的平均成交价 |
-| `approved_orders[].est_order_value_usdt` | float | 是 | 估算订单金额（USDT）|
-| `approved_orders[].est_slippage_bps` | float | 是 | 估算滑点（basis points）|
-| `approved_orders[].orderbook_snapshot_age_ms` | int | 是 | 引用的订单簿快照新鲜度（毫秒）|
-
----
-
-### 3.6.2 `quant:execution_rejected` [Sprint 4+]
-
-执行质量检查失败。在 `rejection_policy=all_or_nothing` 下，任一 delta order 未通过即整批拒绝，不会下单。
-
-**触发条件**: ExecutionService 检查到至少一笔 delta order 未通过滑点 / 深度 / 预算任一检查；或订单簿快照超龄缺失。
-
-**`data` 载荷**:
+**`execution_rejected` 载荷**：
 
 ```json
 {
-  "rebalance_id": "rb-20260302-001",
-  "strategy_name": "baseline_rev",
-  "rejected_at": "2026-03-02T23:59:01Z",
-  "severity": "warning",
-  "rejection_policy": "all_or_nothing",
+  "rebalance_id": "...", "strategy_name": "...",
+  "approved_orders": [ ],
   "rejected_orders": [
-    {
-      "symbol": "XRP/USDT:USDT",
-      "side": "sell",
-      "amount": 150.0,
-      "est_order_value_usdt": 78.30,
-      "reasons": [
-        { "check": "slippage", "threshold_bps": 10, "actual_bps": 23.5 },
-        { "check": "depth", "threshold_ratio": 3.0, "actual_ratio": 1.2 }
-      ]
-    }
-  ],
-  "approved_orders_count": 0,
-  "action_taken": "skip_rebalance"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID |
-| `strategy_name` | string | 是 | 策略名 |
-| `rejected_at` | string (ISO 8601) | 是 | 拒绝时间 |
-| `severity` | string | 是 | `"warning"` \| `"critical"` |
-| `rejection_policy` | string | 是 | `"all_or_nothing"` \| `"partial"` |
-| `rejected_orders` | object[] | 是 | 被拒绝的 delta order 列表 |
-| `rejected_orders[].symbol` | string | 是 | 交易对 |
-| `rejected_orders[].side` | string | 是 | `"buy"` \| `"sell"` |
-| `rejected_orders[].amount` | float | 是 | 订单量 |
-| `rejected_orders[].est_order_value_usdt` | float | 是 | 估算订单金额（USDT）|
-| `rejected_orders[].reasons` | object[] | 是 | 触发拒绝的检查项列表 |
-| `rejected_orders[].reasons[].check` | string | 是 | `"slippage"` \| `"depth"` \| `"budget"` \| `"stale_or_missing_book"` |
-| `rejected_orders[].reasons[].threshold_bps` | float | 否 | 滑点阈值（bps）|
-| `rejected_orders[].reasons[].actual_bps` | float | 否 | 实际估算滑点（bps）|
-| `rejected_orders[].reasons[].threshold_ratio` | float | 否 | 深度阈值 |
-| `rejected_orders[].reasons[].actual_ratio` | float | 否 | 实际深度比 |
-| `approved_orders_count` | int | 是 | 同批次中通过检查的 order 数（`all_or_nothing` 模式下仅用于审计）|
-| `action_taken` | string | 是 | `"skip_rebalance"` \| `"partial_execute"` |
-
----
-
-### 3.7 `quant:risk_rejected`
-
-风控拒绝，不允许下单。
-
-**触发条件**: RiskService 检查到至少一条规则未通过。
-
-**`data` 载荷**:
-
-```json
-{
-  "rebalance_id": "rb-20260302-001",
-  "strategy_name": "baseline_rev",
-  "rejected_at": "2026-03-02T23:59:01Z",
-  "severity": "critical",
-  "violated_rules": [
-    {
-      "rule_name": "max_drawdown_halt",
-      "display_name": "最大回撤止损",
-      "threshold": 0.30,
-      "actual": 0.32,
-      "message": "当前回撤 32% 超过阈值 30%, 触发暂停交易"
-    }
-  ],
-  "action_taken": "halt_trading",
-  "original_signal": {
-    "strategy_name": "baseline_rev",
-    "long_count": 30,
-    "short_count": 30
-  }
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID |
-| `strategy_name` | string | 是 | 策略名 |
-| `rejected_at` | string (ISO 8601) | 是 | 拒绝时间 |
-| `severity` | string | 是 | `"warning"` \| `"critical"` |
-| `violated_rules` | object[] | 是 | 违反的规则列表 |
-| `violated_rules[].rule_name` | string | 是 | 规则标识 |
-| `violated_rules[].display_name` | string | 是 | 规则显示名 |
-| `violated_rules[].threshold` | float | 是 | 阈值 |
-| `violated_rules[].actual` | float | 是 | 实际值 |
-| `violated_rules[].message` | string | 是 | 可读描述 |
-| `action_taken` | string | 是 | 采取的动作: `"halt_trading"` \| `"skip_rebalance"` |
-| `original_signal` | object | 是 | 被拒绝的信号摘要 |
-
----
-
-### 3.8 `quant:order_executed`
-
-订单执行成功（含 dry-run 模式）。
-
-**触发条件**: OrderService 完成一笔订单执行后。
-
-**`data` 载荷**:
-
-```json
-{
-  "rebalance_id": "rb-20260302-001",
-  "order_id": "ord-20260302-001",
-  "symbol": "BTC/USDT:USDT",
-  "side": "buy",
-  "type": "market",
-  "amount": 0.005,
-  "filled_amount": 0.005,
-  "avg_fill_price": 62450.00,
-  "cost": 312.25,
-  "fee": 0.125,
-  "fee_currency": "USDT",
-  "strategy_name": "baseline_rev",
-  "dry_run": true,
-  "executed_at": "2026-03-02T23:59:05Z",
-  "execution_time_ms": 450,
-  "idempotency_key": "idem-rb20260302001-BTCUSDT-buy"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID |
-| `order_id` | string | 是 | 订单唯一 ID |
-| `symbol` | string | 是 | 交易对 |
-| `side` | string | 是 | `"buy"` \| `"sell"` |
-| `type` | string | 是 | 订单类型。V1 固定 `"market"` |
-| `amount` | float | 是 | 下单数量 |
-| `filled_amount` | float | 是 | 成交数量 |
-| `avg_fill_price` | float | 是 | 平均成交价 |
-| `cost` | float | 是 | 成交金额 (USDT) |
-| `fee` | float | 是 | 手续费 |
-| `fee_currency` | string | 是 | 手续费币种 |
-| `strategy_name` | string | 是 | 策略名 |
-| `dry_run` | bool | 是 | 是否为模拟执行 |
-| `executed_at` | string (ISO 8601) | 是 | 执行完成时间 |
-| `execution_time_ms` | int | 是 | 执行耗时 (毫秒) |
-| `idempotency_key` | string | 是 | 幂等键，防止重复执行 |
-
----
-
-### 3.9 `quant:order_failed`
-
-订单执行失败。
-
-**触发条件**: OrderService 重试 3 次后仍失败。
-
-**`data` 载荷**:
-
-```json
-{
-  "rebalance_id": "rb-20260302-001",
-  "order_id": "ord-20260302-005",
-  "symbol": "XRP/USDT:USDT",
-  "side": "sell",
-  "type": "market",
-  "amount": 150.0,
-  "strategy_name": "baseline_rev",
-  "dry_run": false,
-  "error_code": "InsufficientBalance",
-  "error_message": "Account balance insufficient for this order",
-  "retry_count": 3,
-  "failed_at": "2026-03-02T23:59:08Z",
-  "idempotency_key": "idem-rb20260302001-XRPUSDT-sell"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `rebalance_id` | string | 是 | 换仓 ID |
-| `order_id` | string | 是 | 订单 ID |
-| `symbol` | string | 是 | 交易对 |
-| `side` | string | 是 | `"buy"` \| `"sell"` |
-| `type` | string | 是 | 订单类型 |
-| `amount` | float | 是 | 预期下单数量 |
-| `strategy_name` | string | 是 | 策略名 |
-| `dry_run` | bool | 是 | 是否为模拟执行 |
-| `error_code` | string | 是 | 交易所/系统错误码 |
-| `error_message` | string | 是 | 错误描述 |
-| `retry_count` | int | 是 | 已重试次数 |
-| `failed_at` | string (ISO 8601) | 是 | 最终失败时间 |
-| `idempotency_key` | string | 是 | 幂等键 |
-
----
-
-### 3.10 `quant:account_updated`
-
-账户状态同步完成。
-
-**触发条件**: AccountService 定时轮询交易所 API (每 30s) 后。
-
-**`data` 载荷**:
-
-```json
-{
-  "exchange": "binance",
-  "balance": {
-    "total_equity": 10234.56,
-    "available_balance": 5120.30,
-    "used_margin": 5114.26,
-    "unrealized_pnl": 123.45,
-    "currency": "USDT"
-  },
-  "positions_count": 45,
-  "long_count": 30,
-  "short_count": 15,
-  "open_orders_count": 3,
-  "synced_at": "2026-03-02T23:58:30Z"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `exchange` | string | 是 | 交易所标识 |
-| `balance.total_equity` | float | 是 | 总权益 (USDT) |
-| `balance.available_balance` | float | 是 | 可用余额 |
-| `balance.used_margin` | float | 是 | 已用保证金 |
-| `balance.unrealized_pnl` | float | 是 | 未实现盈亏 |
-| `balance.currency` | string | 是 | 计价币种 |
-| `positions_count` | int | 是 | 当前持仓总数 |
-| `long_count` | int | 是 | 多头数量 |
-| `short_count` | int | 是 | 空头数量 |
-| `open_orders_count` | int | 是 | 活跃挂单数 |
-| `synced_at` | string (ISO 8601) | 是 | 同步完成时间 |
-
----
-
-## 四、V1 Redis 键
-
-V1 所需的全部 Redis 键:
-
-| 键模式 | 类型 | 用途 | 写入者 |
-|--------|------|------|--------|
-| `quant:asset_pool:{exchange}` | Set | 默认资产池 (Top-100 symbols) | AssetPoolService |
-| `quant:kline:{symbol}:{timeframe}` | String (JSON) | 最新 K 线快照 | AggregatorService |
-| `quant:features:latest:{symbol}` | String (JSON) | 最新特征快照 | FeatureService |
-| `quant:signal:latest` | String (JSON) | 最新策略信号快照（StrategySignalBatch，**不含** sizing） | StrategyService |
-| `quant:risk:latest` | String (JSON) | 最新风控后的目标组合（SizedPortfolio，USDT 名义金额） | RiskService |
-| `quant:strategy:state:crypto_pairs_mean_reversion` | String (JSON) | crypto pairs 运行时状态（pair position、bars_in_trade、active segment） | StrategyService |
-| `quant:strategy:crypto_pairs:segments` | String (JSON) | 导入的 frozen pair segment 快照 | StrategyService |
-| `quant:account:balance` | String (JSON) | 账户余额快照 | AccountService |
-| `quant:account:positions` | String (JSON) | 当前持仓快照 | AccountService |
-| `quant:account:orders` | String (JSON) | 活跃挂单快照 | AccountService |
-| `quant:portfolio:snapshot` | String (JSON) | NAV / PnL / 回撤等组合指标 | AccountService |
-| `quant:heartbeat:{service}` | String (JSON + TTL 120s) | 服务心跳 | 各服务 |
-| `quant:state:{service}:last_run` | String | 上次执行时间戳 | 各服务 |
-| `quant:state:{service}:status` | String | 运行状态 (`running` \| `idle` \| `error`) | 各服务 |
-| `quant:risk:status` | String (JSON) | 风控状态快照 | RiskService |
-| `quant:risk:disabled_symbols` | Set | 被停用的交易对 | RiskService |
-| `quant:system:emergency_stop` | String (JSON) | 紧急停机状态 | API Gateway |
-
-### 键值示例
-
-**`quant:features:latest:{symbol}`**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "timestamp": "2026-03-02T23:59:00Z",
-  "features": {
-    "zscore_neg_ret_2h": 1.85,
-    "zscore_neg_ret_4h": 1.42,
-    "ret_2h": -0.0032,
-    "ret_4h": -0.0058
-  }
-}
-```
-
-**`quant:signal:latest`**（StrategyService 写入，**不含** sizing；结构与 `quant:signal_generated` 事件载荷一致）:
-
-```json
-{
-  "strategy_name": "baseline_rev",
-  "mode": "single",
-  "signal_timestamp": "2026-03-02T23:59:00+00:00",
-  "rebalance_id": "rb-20260302-001",
-  "pool_name": "default",
-  "signals": [
-    { "symbol": "BTC/USDT:USDT", "side": "long", "signal_value": 1.85, "reason": "baseline_rev_long" },
-    { "symbol": "DOGE/USDT:USDT", "side": "short", "signal_value": -2.10, "reason": "baseline_rev_short" }
-  ],
-  "metadata": {
-    "n_candidates": 480,
-    "long_count": 30,
-    "short_count": 30,
-    "skipped": false,
-    "cross_section_std": 0.72,
-    "stale_symbols_count": 0
-  }
-}
-```
-
-**Pair spread 信号 metadata 扩展**:
-
-`crypto_pairs_mean_reversion` 仍写入 `quant:signal:latest`，但每条腿会增加 `metadata`，供 RiskService 做 pair sizing：
-
-```json
-{
-  "symbol": "BTC/USDT",
-  "side": "long",
-  "signal_value": 1.0,
-  "reason": "crypto_pairs_1h:BTCUSDT-ETHUSDT_y",
-  "metadata": {
-    "strategy_type": "pair_spread",
-    "pair_id": "1h:BTCUSDT-ETHUSDT",
-    "leg": "y",
-    "target_state": 1,
-    "hedge_ratio": 1.25,
-    "leg_notional_multiplier": 1.0,
-    "freq": "1h"
-  }
-}
-```
-
-旧策略不带 `metadata` 时仍按原 V1 契约处理。
-
-**`quant:risk:latest`**（RiskService 写入，USDT 名义金额；结构与 `quant:risk_approved` 事件载荷一致）:
-
-```json
-{
-  "strategy_name": "baseline_rev",
-  "signal_timestamp": "2026-03-02T23:59:00+00:00",
-  "rebalance_id": "rb-20260302-001",
-  "mode": "single",
-  "pool_name": "default",
-  "positions": [
-    { "symbol": "BTC/USDT:USDT", "side": "long", "notional_usdt": 100.0, "signal_value": 1.85, "reason": "baseline_rev_long" },
-    { "symbol": "DOGE/USDT:USDT", "side": "short", "notional_usdt": 100.0, "signal_value": -2.10, "reason": "baseline_rev_short" }
-  ],
-  "sizing_metadata": {
-    "sizing_scheme": "hardcoded_placeholder",
-    "per_position_notional_usdt": 100.0,
-    "total_notional_usdt": 6000.0,
-    "note": "Sprint 4 will replace this with equity-based sizing; current value is a fixed stub constant."
-  },
-  "strategy_metadata": { "n_candidates": 480, "long_count": 30, "short_count": 30, "skipped": false }
-}
-```
-
-**`quant:portfolio:snapshot`**:
-
-```json
-{
-  "nav": 10234.56,
-  "initial_nav": 10000.00,
-  "total_return": 0.023456,
-  "daily_pnl": -12.50,
-  "daily_pnl_pct": -0.0012,
-  "drawdown": -0.053,
-  "max_drawdown": -0.082,
-  "sharpe_30d": 1.85,
-  "volatility_30d": 0.185,
-  "updated_at": "2026-03-02T23:59:00Z"
-}
-```
-
-**`quant:heartbeat:{service}`** (TTL 120s):
-
-```json
-{
-  "service": "strategy_service",
-  "status": "healthy",
-  "timestamp": "2026-03-02T23:58:30Z",
-  "uptime_seconds": 86400,
-  "metrics": {
-    "last_signal_time": "2026-03-02T23:55:00Z",
-    "active_strategy": "baseline_rev"
-  }
-}
-```
-
----
-
-## 五、V2 新增 Pub/Sub 通道 [V2]
-
-V2 在 V1 的 9 个通道基础上新增 5 个通道，支持双源数据管线和 tick 特征链路。
-
-### 5.1 V2 通道总览
-
-```mermaid
-flowchart TD
-    subgraph tickPath ["Tick 聚合路径 (V2)"]
-        DataIngestion["DataIngestionService"] -->|"Redis Stream"| DollarBar["DollarBarService"]
-        DollarBar -->|dollar_bar_generated| TickFeature["TickFeatureService"]
-        TickFeature -->|tick_features_enriched| BarAdapter["BarSourceAdapterService"]
-    end
-
-    subgraph klinePath ["直拉 Kline 路径"]
-        DirectKline["DirectKlineService"] -->|kline_raw| BarAdapter
-    end
-
-    BarAdapter -->|bar_normalized| Feature["FeatureService"]
-    BarAdapter -.->|bar_source_mismatch| Monitor["MonitorService"]
-    Feature -->|feature_calculated| Strategy["StrategyService"]
-```
-
-| 新增通道 | 发布者 | 订阅者 | 频率 |
-|---------|--------|--------|------|
-| `quant:dollar_bar_generated` | DollarBarService | TickFeatureService | 每根 Dollar Bar |
-| `quant:tick_features_enriched` | TickFeatureService | BarSourceAdapterService | 每根 Dollar Bar |
-| `quant:kline_raw` | DirectKlineService | BarSourceAdapterService | 每根 K 线 |
-| `quant:bar_normalized` | BarSourceAdapterService | FeatureService | 归一化后 |
-| `quant:bar_source_mismatch` | BarSourceAdapterService | MonitorService | 偏差超阈值时 |
-
----
-
-### 5.2 `quant:dollar_bar_generated` [V2]
-
-Dollar Bar 聚合完成，输出 23 列结构。
-
-**触发条件**: DollarBarService 累计 dollar_volume 达到自适应阈值 (\(\theta\)) 后切分。
-
-**`data` 载荷**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "bar_id": "db-BTC-20260302-145230",
-  "threshold": 500000.0,
-  "bar": {
-    "timestamp": "2026-03-02T14:52:30Z",
-    "open": 62400.00,
-    "high": 62520.00,
-    "low": 62380.00,
-    "close": 62480.00,
-    "volume": 8.025,
-    "buy_volume": 4.512,
-    "sell_volume": 3.513,
-    "dollar_volume": 501250.00,
-    "buy_sell_imbalance": 0.1244,
-    "vwap": 62461.06,
-    "tick_count": 342,
-    "duration_seconds": 45.2,
-    "open_interest_delta": 0.5,
-    "high_low_range": 140.00,
-    "body_range": 80.00,
-    "upper_shadow": 40.00,
-    "lower_shadow": 20.00,
-    "trades_per_second": 7.57,
-    "avg_trade_size": 0.0235,
-    "max_trade_size": 0.250,
-    "price_impact": 0.00032,
-    "aggressor_ratio": 0.562,
-    "kyle_lambda_raw": 0.0015
-  }
-}
-```
-
-**核心字段 (strategy_3 ofi_14d 依赖)**:
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `bar.buy_sell_imbalance` | float | \(\frac{buy\_volume - sell\_volume}{volume}\)，日级聚合为 `ofi_d` |
-| `bar.dollar_volume` | float | \(\sum p_i q_i\)，日级聚合为 `dollar_volume_d` |
-
-**核心字段 (strategy_1 tick 特征依赖)**:
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `bar.volume` | float | 总成交量 |
-| `bar.buy_volume` | float | 主动买成交量 |
-| `bar.sell_volume` | float | 主动卖成交量 |
-| `bar.tick_count` | int | bar 内 tick 数 |
-| `bar.aggressor_ratio` | float | 主动买比例 |
-| `bar.kyle_lambda_raw` | float | Kyle's Lambda 原始值 |
-
----
-
-### 5.3 `quant:tick_features_enriched` [V2]
-
-Tick 微观特征计算完成（9 个特征），strategy_1 所需。
-
-**触发条件**: TickFeatureService 对最新 Dollar Bar 的 rolling 50 bars 计算完成后。
-
-**`data` 载荷**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "bar_id": "db-BTC-20260302-145230",
-  "features": {
-    "tick_vpin": 0.342,
-    "tick_toxicity_run_mean": 0.285,
-    "tick_toxicity_run_max": 0.512,
-    "tick_toxicity_run_ratio": 0.556,
-    "tick_kyle_lambda": 0.0018,
-    "tick_burstiness": 1.24,
-    "tick_jump_ratio": 0.085,
-    "tick_whale_imbalance": 0.123,
-    "tick_whale_impact": 0.0045
-  },
-  "rolling_window": 50,
-  "calculated_at": "2026-03-02T14:52:31Z"
-}
-```
-
-| 特征名 | 类型 | 说明 |
-|--------|------|------|
-| `tick_vpin` | float | 成交量加权知情交易概率 (Volume-Synchronized PIN) |
-| `tick_toxicity_run_mean` | float | 毒性流均值 |
-| `tick_toxicity_run_max` | float | 毒性流最大值 |
-| `tick_toxicity_run_ratio` | float | 毒性流比率 |
-| `tick_kyle_lambda` | float | Kyle's Lambda (市场深度) |
-| `tick_burstiness` | float | 交易聚集度 |
-| `tick_jump_ratio` | float | 跳跃比率 |
-| `tick_whale_imbalance` | float | 大单买卖不平衡 |
-| `tick_whale_impact` | float | 大单价格冲击 |
-
----
-
-### 5.4 `quant:kline_raw` [V2]
-
-直拉 K 线数据（双源模式的 Kline 路径）。
-
-**触发条件**: DirectKlineService 从交易所拉取新 K 线后。
-
-**`data` 载荷**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "timeframe": "1m",
-  "kline": {
-    "timestamp": "2026-03-02T23:58:00Z",
-    "open": 62400.00,
-    "high": 62500.00,
-    "low": 62380.00,
-    "close": 62450.00,
-    "volume": 12.345
-  },
-  "source": "direct_kline",
-  "exchange": "binance"
-}
-```
-
-结构与 V1 `kline_aggregated` 一致，但作为 BarSourceAdapterService 的输入而非直接给 FeatureService。
-
----
-
-### 5.5 `quant:bar_normalized` [V2]
-
-统一 Bar 契约，屏蔽上游来源差异。下游 Feature/Strategy/Risk/Order 不感知数据来源。
-
-**触发条件**: BarSourceAdapterService 归一化完成后。
-
-**`data` 载荷**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "timeframe": "adaptive",
-  "source": "tick_agg",
-  "bar": {
-    "timestamp": "2026-03-02T14:52:30Z",
-    "open": 62400.00,
-    "high": 62520.00,
-    "low": 62380.00,
-    "close": 62480.00,
-    "volume": 8.025,
-    "dollar_volume": 501250.00,
-    "buy_sell_imbalance": 0.1244
-  },
-  "tick_features": {
-    "tick_vpin": 0.342,
-    "tick_kyle_lambda": 0.0018,
-    "tick_jump_ratio": 0.085
-  },
-  "normalized_at": "2026-03-02T14:52:31Z"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `symbol` | string | 是 | 交易对 |
-| `timeframe` | string | 是 | `"1m"` (direct_kline) 或 `"adaptive"` (dollar_bar) |
-| `source` | string | 是 | `"tick_agg"` \| `"direct_kline"` \| `"hybrid"` |
-| `bar` | object | 是 | 归一化后的 OHLCV + 扩展字段 |
-| `bar.dollar_volume` | float | 否 | tick_agg 来源时可用；direct_kline 时为 null |
-| `bar.buy_sell_imbalance` | float | 否 | tick_agg 来源时可用 |
-| `tick_features` | object \| null | 否 | tick_agg 来源时携带 tick 特征；direct_kline 时为 null |
-| `normalized_at` | string (ISO 8601) | 是 | 归一化完成时间 |
-
----
-
-### 5.6 `quant:bar_source_mismatch` [V2]
-
-双源对账偏差告警（仅 `hybrid` 模式触发）。
-
-**触发条件**: BarSourceAdapterService 比较 tick_agg 与 direct_kline 的 OHLCV，偏差超过阈值。
-
-**`data` 载荷**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "mismatch_type": "close_price",
-  "tick_agg_value": 62480.00,
-  "direct_kline_value": 62510.00,
-  "deviation_bps": 4.8,
-  "threshold_bps": 5,
-  "consecutive_mismatches": 3,
-  "auto_fallback_triggered": false,
-  "detected_at": "2026-03-02T14:53:00Z"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `symbol` | string | 是 | 交易对 |
-| `mismatch_type` | string | 是 | 偏差字段: `"open"` \| `"high"` \| `"low"` \| `"close_price"` \| `"volume"` |
-| `tick_agg_value` | float | 是 | tick 聚合路径的值 |
-| `direct_kline_value` | float | 是 | 直拉 kline 路径的值 |
-| `deviation_bps` | float | 是 | 偏差 (基点) |
-| `threshold_bps` | int | 是 | 配置的偏差阈值 |
-| `consecutive_mismatches` | int | 是 | 连续偏差次数 |
-| `auto_fallback_triggered` | bool | 是 | 是否已触发自动降级到 direct_kline |
-| `detected_at` | string (ISO 8601) | 是 | 检测时间 |
-
----
-
-## 六、V2 新增 Redis Streams [V2]
-
-### `quant:stream:aggTrades:{symbol}`
-
-高频逐笔成交数据流，DataIngestionService 写入，DollarBarService 消费。
-
-| 属性 | 值 |
-|------|-----|
-| **类型** | Redis Stream |
-| **MAXLEN** | ~100000 (近似裁剪) |
-| **峰值吞吐** | ~120K msg/s (488 symbols × ~250 ticks/s) |
-| **消费者组** | `dollar_bar_consumers` |
-| **消费者命名** | `dollar_bar_{symbol}` |
-
-**Stream Entry 结构**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "timestamp": 1709423550123,
-  "price": "62450.00",
-  "quantity": "0.025",
-  "is_buyer_maker": "false"
-}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `symbol` | string | 交易对 |
-| `timestamp` | int (ms) | 成交时间 (Unix 毫秒) |
-| `price` | string | 成交价 (字符串避免精度丢失) |
-| `quantity` | string | 成交量 |
-| `is_buyer_maker` | string | `"true"` \| `"false"`，主动方方向标记 |
-
----
-
-## 七、V2 新增 Redis 键 [V2]
-
-| 键模式 | 类型 | 用途 | 写入者 |
-|--------|------|------|--------|
-| `quant:asset_pool:{exchange}:t50_monthly` | Set | T50 月度流动性池 (strategy_3) | AssetPoolService |
-| `quant:features:daily:{symbol}` | String (JSON) | 日级聚合特征缓存 | FeatureService |
-| `quant:features:rolling:{symbol}` | String (JSON) | 多日滚动特征缓存 | FeatureService |
-| `quant:dollar_bar:{symbol}` | List | Dollar Bar 缓存 (最近 200 bars) | DollarBarService |
-| `quant:kline:raw:{symbol}:{timeframe}` | String (JSON) | 直拉 kline 最新快照 | DirectKlineService |
-| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 | BarSourceAdapterService |
-| `quant:stream:aggTrades:{symbol}` | Stream | 高频 tick 数据 | DataIngestionService |
-
-### V2 键值示例
-
-**`quant:features:daily:{symbol}`**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "date": "2026-03-02",
-  "close_d": 62480.00,
-  "ret_d": -0.0012,
-  "ofi_d": 0.0523,
-  "dollar_volume_d": 12500000.00,
-  "updated_at": "2026-03-02T23:59:00Z"
-}
-```
-
-**`quant:features:rolling:{symbol}`**:
-
-```json
-{
-  "symbol": "BTC/USDT:USDT",
-  "date": "2026-03-02",
-  "ofi_14d": 0.0345,
-  "valid_days": 14,
-  "updated_at": "2026-03-02T23:59:00Z"
-}
-```
-
-**V2 `quant:features:latest:{symbol}` 扩展字段**:
-
-V2 在 V1 特征基础上新增以下字段：
-
-| 新增特征名 | 类型 | 说明 | 依赖策略 |
-|-----------|------|------|---------|
-| `tick_vpin_24h` | float \| null | EOD 前 24h bar 级 tick_vpin 的均值 | strategy_1 |
-| `zscore_vpin` | float \| null | tick_vpin_24h 的 z-score (window=30, negate=False) | strategy_1 |
-| `zscore_jump` | float \| null | tick_jump_ratio 的 z-score | strategy_1 |
-| `volatility` | float \| null | 波动率指标 | strategy_1 (regime_switch) |
-| `ofi_14d` | float \| null | 14 日滚动 OFI 均值 | strategy_3 |
-| `zscore_ofi_14d` | float \| null | ofi_14d 的截面 z-score | strategy_3 |
-
-**V2 `quant:signal:latest` 扩展**:
-
-多策略模式下增加 `per_strategy` 字段，每条子策略提供自己的 `signals`（无 sizing）和 ensemble 权重（注意：这里的 `weight` 是**策略集成权重**，不是单仓位权重）：
-
-```json
-{
-  "mode": "ensemble",
-  "ensemble_method": "weighted_average",
-  "signal_timestamp": "2026-03-02T23:59:00+00:00",
-  "signals": [ ],
-  "metadata": { "long_count": 20, "short_count": 20 },
-  "per_strategy": [
-    {
-      "strategy_name": "baseline_rev",
-      "ensemble_weight": 0.3,
-      "pool_name": "default",
-      "long_count": 30,
-      "short_count": 30
-    },
-    {
-      "strategy_name": "ofi_14d",
-      "ensemble_weight": 0.4,
-      "pool_name": "t50_monthly",
-      "long_count": 15,
-      "short_count": 15
-    }
+    { "symbol": "SOL/USDT:USDT", "side": "short", "reason": "insufficient_depth", "needed": 0.76, "available": 0.09 }
   ]
 }
 ```
 
----
+`reason`：`stale_or_missing_orderbook` | `invalid_mid_price` | `insufficient_depth`。订单簿快照超 `execution.yaml` 的 `orderbook_max_age_ms` 视为过期。
 
-## 八、V2 `feature_calculated` 载荷扩展 [V2]
+### 3.4 `order_executed` / `order_failed` / `order_rebalanced`
 
-V2 的 `feature_calculated` 事件增加 `features_version: "v2"` 标识，特征字段扩展：
+Order 订阅 `execution_approved`，对**本账户净持仓**做 Target Portfolio 差量（先平后开），幂等下单（默认 dry-run）。
+
+**`order_executed`**（每笔，含 dry-run）：
 
 ```json
 {
-  "calculation_id": "fc-20260302-235900",
-  "features_version": "v2",
-  "features": {
-    "BTC/USDT:USDT": {
-      "zscore_neg_ret_2h": 1.85,
-      "zscore_neg_ret_4h": 1.42,
-      "ret_2h": -0.0032,
-      "ret_4h": -0.0058,
-      "tick_vpin_24h": 0.342,
-      "zscore_vpin": 0.85,
-      "zscore_jump": 1.12,
-      "volatility": 0.0234,
-      "ofi_14d": 0.0345,
-      "zscore_ofi_14d": 1.56
-    }
-  }
+  "rebalance_id": "...", "order_id": "ord-acctA-20260613-001",
+  "symbol": "BTC/USDT:USDT", "side": "buy", "type": "market",
+  "amount": 0.013451, "filled_amount": 0.013451, "avg_fill_price": 62455.0,
+  "cost": 840.1, "fee": 0.42, "fee_currency": "USDT",
+  "strategy_name": "monthly_majors_vs_alts", "dry_run": true,
+  "executed_at": "2026-06-13T00:10:05Z", "execution_time_ms": 450,
+  "idempotency_key": "idem-rb-...-BTCUSDT-buy"
 }
 ```
 
-StrategyService 根据策略配置的 `required_features` 选取所需子集。
+**`order_failed`**（重试 3 次后）：`{ rebalance_id, order_id, symbol, side, amount, strategy_name, dry_run, error_code, error_message, retry_count, failed_at, idempotency_key }`。
 
----
+**`order_rebalanced`**（整轮差量完成）：`{ rebalance_id, strategy_name, orders_executed, orders_failed, dry_run, completed_at }` → Account 收到后立即同步一次。
 
-## 九、可靠性与恢复约定
+### 3.5 `account_updated`
 
-1. **主路径**采用 Pub/Sub 实时触发。
-2. 服务必须实现**定时兜底任务**（防止 Pub/Sub 丢消息导致流程中断）。
-3. 服务重启后需读取 `quant:state:{service}:*` 做**补执行判断**。
-4. Order 相关消费侧必须实现**幂等**（通过 `idempotency_key` 防止重复执行下单）。
-5. [V2] `hybrid` 模式建议并行消费 `tick_agg` 与 `direct_kline`，并基于 `bar_source_mismatch` 做**自动降级**。
+Account 轮询交易所后发布：
 
----
+```json
+{
+  "exchange": "binance", "account": "acctA",
+  "balance": { "total_equity": 10234.56, "available_balance": 5120.30, "used_margin": 5114.26, "unrealized_pnl": 123.45, "currency": "USDT" },
+  "positions_count": 20, "long_count": 1, "short_count": 19, "open_orders_count": 0,
+  "synced_at": "2026-06-13T00:10:30Z"
+}
+```
 
-## 十、与外部 API 的边界
+## 四、Redis 键
 
-- **对外查询与控制**: 使用 [HTTP API](http.md)。
-- **对外实时推送**: 使用 [WebSocket API](websocket.md)。
-- **服务内部事件流**: 使用本文档定义的 Redis 契约。
+### 4.1 账户作用域键（`quant:{account}:<名>`）
+
+| 逻辑键 | 类型 | 写入者 |
+|--------|------|--------|
+| `signal:latest` | String | Strategy（最新 Target Portfolio，不含 sizing） |
+| `risk:latest` | String | Risk（最新 SizedPortfolio） |
+| `strategy:{name}:state` | String | StreamingStrategy（held / CB / bar 进度快照） |
+| `strategy:enabled:{name}` | String | 运维/API（策略级启停开关，Risk 闸门读） |
+| `account:balance` / `account:positions` / `account:orders` | String | Account |
+| `portfolio:snapshot` | String | Account（NAV/PnL/回撤） |
+| `portfolio:nav_history` | Sorted Set | Account（NAV 历史，前端折线图初始化） |
+| `portfolio:initial_nav` / `peak_nav` / `daily_open_nav:{date}` | String | Account |
+| `order:rebalance:{rebalance_id}` | String (SETNX) | Order（调仓幂等闸） |
+| `risk:status` / `risk:disabled_symbols` | String | Risk |
+| `state:{service}:last_run` / `state:{service}:status` | String | 各服务（兜底补执行判断） |
+
+### 4.2 公共/全局键（无账户前缀）
+
+| 键 | 类型 | 写入者 | 消费者 |
+|----|------|--------|--------|
+| `market:trades` | Stream | DataService（`trades_raw`） | 策略 6 插件（独立消费者组） |
+| `market:orderbook` | Stream | DataService（`orderbook`） | — |
+| `quant:orderbook:{symbol}` | String | DataService（覆盖写最新 L2 + mid_price + ts_ms） | 各栈 Execution |
+| `quant:asset_pool:{exchange}` | Set | AssetPoolService | — |
+| `quant:heartbeat:{service}@{account}` | String + TTL 120s | 各服务（共享层无 `@account`） | Monitor / API |
+| `quant:system:emergency_stop` | String | API 网关 | 各栈 Risk + Order |
+
+### 4.3 键值示例
+
+**`quant:{account}:portfolio:snapshot`**：
+
+```json
+{
+  "nav": 10234.56, "initial_nav": 10000.0, "total_return": 0.0235,
+  "daily_pnl": -12.5, "daily_pnl_pct": -0.0012,
+  "drawdown": -0.053, "max_drawdown": -0.082,
+  "sharpe_30d": 1.85, "volatility_30d": 0.185, "updated_at": "2026-06-13T00:10:00Z"
+}
+```
+
+**`quant:heartbeat:risk_service@acctA`**（TTL 120s）：
+
+```json
+{ "service": "risk_service", "account": "acctA", "status": "healthy", "timestamp": "2026-06-13T00:09:30Z", "uptime_seconds": 86400 }
+```
+
+## 五、可靠性约定
+
+1. 主路径 Pub/Sub 实时触发；每服务实现定时兜底（防丢消息）。
+2. 重启读 `quant:{account}:state:{service}:*` 判补执行；StreamingStrategy 额外 `restore_state()` + 回放近期 `market:trades`。
+3. Order 侧幂等：`rebalance_id` 为键，`quant:{account}:order:rebalance:{id}` SETNX 闸 + 单笔 `idempotency_key` + 交易所 `clientOrderId` 三层。
+4. 急停：`quant:system:emergency_stop` 置位 → 各栈 Risk 拒批新信号 + Order 发单前二次检查。
+
+## 六、与外部 API 的边界
+
+对外查询/控制用 [HTTP API](http.md)；对外实时推送用 [WebSocket API](websocket.md)；服务内部事件用本文契约。

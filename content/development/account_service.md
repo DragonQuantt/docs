@@ -21,7 +21,9 @@ Binance User Data Stream (ccxt.pro)
 _periodic_refresh_loop()          每 poll_interval 秒 REST 全量同步（刷新 mark_price）
 _rest_fallback_loop()             WS 连续故障时启动，恢复后自动退出
 
-PostgreSQL (_db_persist_loop())   每 db_persist_interval 秒更新 accounts.updated_at
+PostgreSQL (_db_persist_loop())   每 db_persist_interval 秒：
+                                  1. 刷新 accounts.updated_at
+                                  2. 将 portfolio 快照写入 portfolio_snapshots 表
 ```
 
 ### 数据同步优先级
@@ -58,6 +60,12 @@ PostgreSQL (_db_persist_loop())   每 db_persist_interval 秒更新 accounts.upd
 | **Publish** | `quant:account_updated` | 每次账户状态变化后发布，携带余额摘要与持仓计数 |
 | **Subscribe** | `quant:order_rebalanced` | 收到再平衡完成事件后立即触发一次 REST 全量同步 |
 
+### Sorted Set（NAV 历史）
+
+| Key | 说明 |
+|-----|------|
+| `quant:portfolio:nav_history` | score = unix 时间戳，member = JSON（nav、drawdown、max_drawdown、updated_at）。自动裁剪超出 `nav_history_hours` 的旧条目 |
+
 ---
 
 ## REST API
@@ -66,14 +74,14 @@ PostgreSQL (_db_persist_loop())   每 db_persist_interval 秒更新 accounts.upd
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/balance` | 当前余额（从 Redis 缓存读取） |
-| GET | `/positions` | 当前持仓列表，含 `mark_price`、`actual_weight` |
-| GET | `/open-orders` | 当前活跃挂单 |
 | GET | `/health` | 服务健康状态（Redis 连通性 + 最新心跳数据） |
+| GET | `/position/` | 当前持仓列表，含 `mark_price`、`actual_weight` |
+| GET | `/portfolio/balance` | 当前余额快照（从 Redis 缓存读取） |
 | GET | `/portfolio/snapshot` | Portfolio 综合快照（NAV、收益率、回撤等） |
-| GET | `/portfolio/target-positions` | 策略输出的目标持仓（读 `quant:signal:latest`） |
-| GET | `/portfolio/position-deviation` | 目标仓位与实际仓位的偏差分析 |
-| GET | `/signals/latest` | 最新信号快照（读 `quant:signal:latest`） |
+| GET | `/portfolio/snapshot-history` | 过去 N 小时的 NAV 历史序列（从 Redis Sorted Set 读取，支持 `?hours=` 参数） |
+| GET | `/portfolio/nav-history` | 历史 NAV 曲线（从 PostgreSQL 读取，支持 `start_date`、`end_date`、`interval=daily\|hourly`） |
+| GET | `/portfolio/pnl-history` | 每日盈亏（从 PostgreSQL 读取，支持 `start_date`、`end_date`） |
+| GET | `/portfolio/drawdown-history` | 回撤曲线（从 PostgreSQL 读取，支持 `start_date`、`end_date`） |
 
 所有响应格式：
 
@@ -88,14 +96,16 @@ PostgreSQL (_db_persist_loop())   每 db_persist_interval 秒更新 accounts.upd
 
 数据不可用时返回 `code: 50300`。
 
+> `/portfolio/nav-history`、`/portfolio/pnl-history`、`/portfolio/drawdown-history` 依赖 PostgreSQL，未配置 `DatabaseManager` 时返回 `50300`。
+
 ---
 
 ## WebSocket API
 
 | 端点 | 说明 |
 |------|------|
-| `ws://<host>/api/v1/account/ws/positions` | 实时持仓推流 |
-| `ws://<host>/api/v1/account/ws/portfolio` | 实时 Portfolio 快照推流 |
+| `ws://<host>/api/v1/account/position/ws` | 实时持仓推流 |
+| `ws://<host>/api/v1/account/portfolio/ws` | 实时 Portfolio 快照推流 |
 
 ### 推送机制（三路并发）
 
@@ -120,7 +130,8 @@ PostgreSQL (_db_persist_loop())   每 db_persist_interval 秒更新 accounts.upd
 | `account_id` | `str` | `default` | 账户唯一标识，用于 DB 持久化 |
 | `account_name` | `str` | `默认账户` | 账户显示名称 |
 | `poll_interval` | `int` | `30` | REST 周期刷新间隔（秒），同时控制 REST 降级轮询频率 |
-| `db_persist_interval` | `int` | `30` | PostgreSQL `accounts.updated_at` 刷新间隔（秒） |
+| `db_persist_interval` | `int` | `30` | PostgreSQL 持久化间隔（秒）：刷新 `accounts.updated_at` + 写入 `portfolio_snapshots` |
+| `nav_history_hours` | `int` | `24` | Redis Sorted Set 保留的 NAV 历史时间窗口（小时） |
 | `ws_max_consecutive_errors` | `int` | `5` | WS 连续失败次数阈值，超过后切 REST 降级 |
 | `ws_reconnect_delay` | `int` | `10` | WS 异常后重连等待时间（秒） |
 | `heartbeat_ttl` | `int` | `120` | Redis 心跳 Key 的 TTL（秒） |
@@ -174,10 +185,11 @@ main account-service run --env dev --poll 30 --host 0.0.0.0 --port 8000 --log-le
   Mode: DEMO (Testnet)
   Poll interval (s): 30
   API: http://0.0.0.0:8001
-  Account API: http://0.0.0.0:8001/api/v1/account/balance
   Health: http://0.0.0.0:8001/api/v1/account/health
-  WS positions: ws://0.0.0.0:8001/api/v1/account/ws/positions
-  WS portfolio: ws://0.0.0.0:8001/api/v1/account/ws/portfolio
+  Positions: http://0.0.0.0:8001/api/v1/account/position/
+  Balance: http://0.0.0.0:8001/api/v1/account/portfolio/balance
+  WS positions: ws://0.0.0.0:8001/api/v1/account/position/ws
+  WS portfolio: ws://0.0.0.0:8001/api/v1/account/portfolio/ws
   Press Ctrl+C to stop
 ============================================================
 ```
@@ -187,6 +199,6 @@ main account-service run --env dev --poll 30 --host 0.0.0.0 --port 8000 --log-le
 ## 注意事项
 
 - **WS 事件触发频率**：Binance User Data Stream 的 `ACCOUNT_UPDATE` 仅在实际成交时推送；无交易活动时 `watch_positions` 启动后只返回一次缓存快照。周期性 REST 刷新（`poll_interval`）解决了此问题，确保 `mark_price` 和 `actual_weight` 按时更新。
-- **DB 可选**：未配置 `DatabaseManager` 时，PostgreSQL 持久化任务直接跳过，不影响 Redis 数据流。
-- **首次启动**：启动时先做一次完整 REST 同步写入 Redis，再启动 WS 监听，确保服务就绪后 API 立即可用。
+- **DB 可选**：未配置 `DatabaseManager` 时，PostgreSQL 持久化任务直接跳过，不影响 Redis 数据流。历史查询端点（`nav-history`、`pnl-history`、`drawdown-history`）在无 DB 时返回 `50300`。
+- **首次启动**：启动时先做一次完整 REST 同步写入 Redis，再启动 WS 监听，确保服务就绪后 API 立即可用。同步完成后通过 `_ensure_account_in_db()` 在 `accounts` 表中 upsert 当前账户记录。
 - **Windows 事件循环**：在 Windows 上使用 `main db init` 命令时，`setup_event_loop()` 自动切换为 `SelectorEventLoop`，避免 psycopg 与 `ProactorEventLoop` 的兼容问题。

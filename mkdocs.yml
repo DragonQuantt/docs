@@ -95,7 +95,6 @@ extra:
 
 extra_javascript:
 - javascripts/mathjax.js
-- https://polyfill.io/v3/polyfill.min.js?features=es6
 - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
@@ -105,13 +104,11 @@ nav:
   - 配置说明: getting-started/configuration.md
 - 架构设计:
   - architecture/index.md
+  - 数据库设计: architecture/database.md
 - 策略概述:
   - 系统设计 V1/V2: overview/index.md
-  - 策略 1: overview/strategy_1.md
-  - 策略 2: overview/strategy_2.md
-  - 策略 3: overview/strategy_3.md
-  - 策略 4: overview/strategy_4.md
-  - Crypto Pairs: overview/strategy_crypto_pairs.md
+  - 策略 5 · 月度轮动 (已实现): overview/strategy_5.md
+  - 策略 6 · ML 美元 bar (设计稿): overview/strategy_6.md
 - 前端:
   - 前端概述: frontend/00_overview.md
   - API 设计: frontend/01_api_design.md
@@ -127,8 +124,10 @@ nav:
   - development/index.md
   - data_service: development/data_service.md
   - account_service: development/account_service.md
+  - account_register: development/account_register.md
 - 部署运维:
   - deployment/index.md
 - 迭代计划:
+  - Phase A 实施计划: sprint/phase_a_plan.md
   - 前端迭代: sprint/front_end_sprint.md
   - 后端迭代: sprint/back_end_sprint.md

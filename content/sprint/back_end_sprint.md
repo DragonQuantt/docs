@@ -3,7 +3,7 @@
 > 编写时间: 2026-03-03
 > 当前阶段: **模拟盘（dry-run / paper trading）**
 > 契约基线: `../api/http.md`, `../api/websocket.md`, `../api/redis.md`
-> 策略基线: V1 = `../overview/strategy_4.md`（rev_1d）; V2 = `../overview/strategy_1.md` + `../overview/strategy_3.md`
+> 策略基线: 当前 = [策略 5 · monthly_majors_vs_alts](../overview/strategy_5.md)（已实现）; 原 V1/V2 候选 rev_1d / rev_x_inv_vpin / ofi_14d 的研究稿已于 2026-06-11 删除（git 历史可查）
 
 ---
 
@@ -30,11 +30,12 @@
 MVP 必须跑通的事件链:
 
 ```
-Data -> Feature -> Strategy -> Risk -> Order(dry-run) -> Account
+Data -> Feature -> Strategy -> Risk -> Execution -> Order(dry-run) -> Account
 
 feature_calculated
   -> signal_generated
   -> risk_approved / risk_rejected
+  -> execution_approved / execution_rejected
   -> order_executed
   -> account_updated
 ```
@@ -44,6 +45,8 @@ feature_calculated
 > ```
 > signal_generated -> risk_approved -> execution_approved / execution_rejected -> order_executed
 > ```
+>
+> 频道名按代码现实修正（2026-06）: 原设计的 `order_approved` 在代码中已拆分为 `risk_approved`（RiskService sizing 通过）与 `execution_approved`（ExecutionService 深度/时效校验通过），以 `common/redis/constants.py` 为准。
 
 核心不变量:
 
@@ -66,6 +69,19 @@ feature_calculated
 | **V1** | V1 Sprint 6 | P2 | 1.5 周 | 回测与模拟盘口径对齐 | HTTP V1 P2 (backtest) |
 | **V2** | V2 Sprint 1 | V2 | 2 周 | 双源 Bar + ofi_14d + 资产池 | HTTP V2 (asset-pool) + Redis V2 事件 |
 | **V2** | V2 Sprint 2 | V2 | 2 周 | Tick 特征 + 多策略并行 | HTTP V2 (strategy 管理, signals/compare) + WS signals |
+
+### Phase A 与 Sprint 的映射（2026-06 补充）
+
+Phase A 目标: 唯一策略 `monthly_majors_vs_alts`（已于 2026-06-11 落地）的真实交易闭环；原并行目标 `crypto_pairs_mean_reversion` 已随 2026-06-11 策略清零移除（git 历史可查）。与本计划及 `INTEGRATION_PLAN.md` 的对应关系:
+
+| Phase A 内容 | 对应原计划 |
+|-------------|-----------|
+| 最短交易闭环（data → bar → feature → strategy → risk → execution → order） | ≈ V1 Sprint 1 |
+| 幂等 `rebalance_id`、错过调仓补偿 | ⊂ V1 Sprint 3（恢复机制与幂等保障） |
+| equity 动态 sizing、急停、报警（Telegram） | ⊂ V1 Sprint 4（风控前置与执行可靠）。**部分已实现（2026-06-11）**: equity 动态 sizing（`abs(target_weight) × equity`，含 minNotional 剔腿与 `max_gross_exposure` 缩减）已落地；急停与报警仍为计划 |
+| 数据归档与持久化 | INTEGRATION_PLAN Phase 1.1/1.3（归档与三表: trades Parquet 归档、`signal_records` / `rebalance_records` 等持久化表） |
+
+**截至 2026-06 现状**: V1 Sprint 1 对应的服务链 data / bar / feature / strategy / risk / execution（即 DataService → BarSourceAdapterService → FeatureService → StrategyService → RiskService → ExecutionService）已实现（最初落地于 `feat/crypto_pairs_strategy` 分支）。**2026-06-11 策略清零**（分支 `feat/majors_vs_alts_vol_target`）: 移除 `baseline_rev` 与 `crypto_pairs_mean_reversion`（含配置类、yaml 与 CLI import 命令，git 历史可查），唯一策略 `monthly_majors_vs_alts` 落地（long BTC 0.7 + ETH 0.3 / short 按 30 日美元成交额排名 top-N 山寨等权，30 天固定网格调仓 + 每日收盘止损检查 + NAV 波动率目标杠杆，无状态 self-feeding 设计）；信号契约（`target_weight` / `signal_type` / 确定性 `rebalance_id`）与 RiskService 真实 sizing（`|target_weight| × equity`，equity 读 `quant:account:balance` 过期回退 `default_equity_usdt`，minNotional 剔腿 + `max_gross_exposure` 比例缩减，`risk_rejected` 已实际发布）均已实现。**OrderService 与持久化仍为 Phase A 余项**（管线终点目前停在 `quant:execution_approved`）。频道命名以代码为准: 原 `order_approved` 已演进为 `risk_approved` / `execution_approved`。
 
 ---
 
@@ -99,8 +115,10 @@ feature_calculated
 | `quant:kline_aggregated` | K 线聚合 → 触发特征计算 |
 | `quant:feature_calculated` | 特征就绪 → 触发策略信号 |
 | `quant:signal_generated` | 信号生成 → 风控审核 |
-| `quant:risk_approved` | 风控通过 → 下单执行 |
+| `quant:risk_approved` | 风控通过（sizing 完成）→ 执行校验 |
 | `quant:risk_rejected` | 风控拒绝 → 告警 |
+| `quant:execution_approved` | 执行校验通过 → 下单执行 |
+| `quant:execution_rejected` | 执行校验拒绝 → 告警 |
 | `quant:order_executed` | 订单执行 → 账户更新 |
 | `quant:order_failed` | 订单失败 → 告警 |
 | `quant:account_updated` | 账户同步完成 |

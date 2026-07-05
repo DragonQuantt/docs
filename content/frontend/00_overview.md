@@ -6,6 +6,19 @@
 
 ---
 
+## Phase A 监控定位（审计型）
+
+> 2026-06 补充。后端 `feat/crypto_pairs_strategy` 分支即将实施 **Phase A**: 月度轮动策略（`monthly_majors_vs_alts`）+ 已实现的 crypto pairs 策略（`crypto_pairs_mean_reversion`）的真实交易闭环。本节及文中【Phase A】标注描述前端配套范围；其余章节为原始整体设计，保留作为长期蓝图。标注约定: 【当前实现】= 前端骨架/后端已落地，【Phase A 计划】= 本阶段将实施。
+
+**核心理念: 月频策略的监控是"审计型"而非"盯盘型"。** 前端不追求秒级盯盘，而是保证四件事:
+
+1. **每次调仓可逐腿复盘** — 新增 RebalanceView 调仓审计页，按 `rebalance_id` 还原 信号权重 → sizing → 执行校验 → 逐单成交 全链路（规格见 `01_api_design.md`）
+2. **调仓间漂移可见** — 目标 vs 实际权重偏差高亮、每仓累计 funding
+3. **报警能到手机** — Telegram 为主通道，仪表盘为详情查看处（页面 30s 轮询足够，不新建 alerts WS）
+4. **30 秒内可人工停止** — 顶栏全局急停按钮（二次确认 → `POST /api/v1/system/emergency-stop`）
+
+---
+
 ## 一、技术选型
 
 | 类别 | 技术 | 版本 | 许可 | 选型理由 |
@@ -62,23 +75,42 @@
 └──────────┴──────────────────────────────────────────────────────────┘
 ```
 
+### 顶栏全局元素（【Phase A 计划】）
+
+| 元素 | 位置 | 行为 | 后端对接 |
+|------|------|------|---------|
+| **急停按钮** | 顶栏右侧常驻 | 二次确认弹窗 → 全局停止下单/调仓 | `POST /api/v1/system/emergency-stop`（写 Redis `quant:system:emergency_stop`，该键后端【当前实现】已定义） |
+| **环境徽章** | 顶栏醒目位置 | 显著区分 `dry_run` / `testnet` / `live`，`live` 高亮警示 | 由健康/风控配置接口透出运行模式（`dry_run`、交易所 sandbox 配置） |
+| 策略级启停开关 | 策略管理页（非顶栏） | 单策略启停 + 二次确认 | 写 Redis `quant:strategy:enabled:{name}`（【Phase A 计划】新增键） |
+
 ---
 
 ## 三、页面清单与功能
 
 | # | 页面 | 路由 | 核心组件 | 数据来源 | Phase |
 |---|------|------|---------|---------|-------|
-| 1 | **总览 Dashboard** | `/` | KPI 卡片 + 小 NAV 曲线 + 服务状态灯 + 最近告警 | 聚合多接口 | P1 |
-| 2 | **仓位监控** | `/positions` | 目标 vs 实际仓位表格, 偏差高亮, 多空分布饼图 | `/api/v1/account/positions`, `/api/v1/portfolio/target-positions` | P1 |
-| 3 | **收益监控** | `/pnl` | NAV 曲线 (Lightweight Charts), 日 PnL 柱状图, 回撤曲线 | `/api/v1/portfolio/nav`, `/api/v1/portfolio/pnl` | P1 |
-| 4 | **风控面板** | `/risk` | 风控规则表 + 当前指标值 + 触发状态, 告警历史时间线 | `/api/v1/risk/*` | P2 |
-| 5 | **订单审计** | `/orders` | 分页表格 (时间/symbol/方向/数量/价格/状态), 筛选器 | `/api/v1/orders/*` | P2 |
+| 1 | **总览 Dashboard** | `/` | KPI 卡片 + 小 NAV 曲线 + 服务状态灯 + 最近告警 | 聚合多接口 | P1 · **Phase A** |
+| 2 | **仓位监控** | `/positions` | 目标 vs 实际仓位表格, 偏差高亮, 多空分布饼图 | `/api/v1/account/positions`, `/api/v1/portfolio/target-positions` | P1 · **Phase A** |
+| 3 | **收益监控** | `/pnl` | NAV 曲线 (Lightweight Charts), 日 PnL 柱状图, 回撤曲线 | `/api/v1/portfolio/nav`, `/api/v1/portfolio/pnl` | P1 · **Phase A** |
+| 4 | **风控面板** | `/risk` | 风控规则表 + 当前指标值 + 触发状态, 告警历史时间线 | `/api/v1/risk/*` | P2 · **Phase A** |
+| 5 | **订单审计** | `/orders` | 分页表格 (时间/symbol/方向/数量/价格/状态), 筛选器 | `/api/v1/orders/*` | P2 · **Phase A** (新增 RebalanceView) |
 | 6 | **策略管理** | `/strategy` | 策略卡片列表, 参数只读, 启停开关, 参数变更表单 | `/api/v1/strategy/*` | P1 (只读) / P4 (写入) |
 | 7 | **信号分析** | `/signals` | 覆盖率/缺失率环形图, symbol 级信号热力图 | `/api/v1/signals/*` | P3 |
 | 8 | **波动率监控** | `/volatility` | 组合级/策略级/symbol级三层 Tab, ECharts 热力图 | `/api/v1/portfolio/volatility` | P3 |
 | 9 | **策略对比** | `/compare` | 双策略 NAV 叠加曲线, Sharpe/MDD/Calmar 对比卡片 | `/api/v1/signals/compare` | P3 |
-| 10 | **系统状态** | `/system` | 服务心跳表, 任务运行状态, 数据管线延迟 | `/api/v1/health/*` | P1 |
+| 10 | **系统状态** | `/system` | 服务心跳表, 任务运行状态, 数据管线延迟 | `/api/v1/health/*` | P1 · **Phase A** |
 | 11 | **回测结果** | `/backtest` | 回测参数表单, 结果指标卡片, NAV 曲线, IS/OOS 分割线 | `/api/v1/backtest/*` | P4 |
+
+> **Phase A 优先级标注**（2026-06）: 标 **Phase A** 的 5+1 个页面构成 Phase A 前端范围——五个现有页面从 mock 接真数据，并在订单审计（orders feature）内新增 **RebalanceView 调仓审计页**。各页 Phase A 要点:
+>
+> - **总览 Dashboard**: 实时 NAV（复用【当前实现】的 portfolio WS `/api/v1/account/portfolio/ws`）、下次调仓倒计时、上次调仓结果徽章、服务心跳灯
+> - **仓位监控**: 目标 vs 实际权重偏差高亮 + 每仓累计 funding
+> - **收益监控**: NAV/回撤 + majors 腿 vs alts 腿归因拆分
+> - **风控面板**: 报警历史（30s 轮询，不新建 WS）
+> - **系统状态**: 心跳卡片 + 下次调仓时间
+> - **订单审计**: 【Phase A 计划】新增 RebalanceView，按 `rebalance_id` 逐腿复盘（见 `01_api_design.md`）
+>
+> 信号分析 / 回测页 Phase A 维持 mock，留给后续。
 
 ---
 

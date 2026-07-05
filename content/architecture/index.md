@@ -1,1699 +1,243 @@
-# 工业级量化模拟盘 — 架构设计文档
+# 架构设计
 
-> 编写时间: 2026-03-03
-> 基于: 现有 V0 代码库 + overview/strategy_1.md (Top 10 多因子策略) + overview/strategy_4.md (rev_1d 1d 反转) + overview/strategy_3.md (ofi_14d 单因子动量)
-> 前置文档: `docs/overview/01_system_design_v1_v2.md`
+> 本文是系统架构的**唯一权威**：模块职责、模块之间的 seam、Redis 命名空间约定都在此定稿。API 细节见 [Redis](../api/redis.md) / [HTTP](../api/http.md) / [WebSocket](../api/websocket.md) / [CLI](../api/cli.md)；表结构见 [数据库设计](database.md)；两个策略的本体见 [策略 5](../overview/strategy_5.md) / [策略 6](../overview/strategy_6.md)。
 
----
+## 一、定位与目标
 
-## 目录
+基于 Binance USDT 永续的量化执行后端。**目标形态：每个策略绑定一个独立（子）账户，自成一条竖直栈；多策略 = 多账户 = 多栈，共享只有公共行情与基础设施。** 当前要跑两个策略（[策略 5 · A0 大币-山寨](../overview/strategy_5.md)、[策略 6 · ML 美元 bar](../overview/strategy_6.md)），架构按 N 栈泛化，新增策略 = 加一个账户 + 一条栈。
 
-- [一、系统设计 — 解耦与高可用](#system-design)
-- [二、目录结构与服务职责](#directory-structure)
-- [三、AWS 部署方案](#aws-deployment)
-- [四、通信总线选型: Redis vs Kafka](#message-bus)
-- [附录 A: 策略兼容性矩阵](#appendix-a)
-- [附录 B: Terraform 模块清单](#appendix-b)
+闭环：
 
----
+> 信号 → 风控 sizing → 执行校验 → 下单 → 账户同步
 
-## 一、系统设计 — 解耦与高可用 {#system-design}
+## 二、设计原则
 
-### 1.1 设计原则
+| 原则 | 含义 | 体现 |
+|------|------|------|
+| **账户级隔离** | 每个策略绑独立（子）账户、自成竖直栈，物理隔离、互不踩仓 | N 条 Strategy→Risk→Execution→Order→Account 栈 |
+| **策略自包含** | 复杂策略自取数据、自算特征、自持状态，只向下游交目标组合 | 两种 self-feeding 形态（scheduler / streaming） |
+| **account-scoped keyspace** | 「按账户给 Redis 键/频道加作用域」收在一个 adapter 里，服务只说逻辑键名 | Keyspace 模块（§六），不是散落在每个服务里的字符串约定 |
+| **目标组合是一等概念** | 「一个完整带符号权重目标 + 对当前持仓做差量」是一个模块，不是一条散文纪律 | Target Portfolio 模块（§五） |
+| **公共行情单一所有者** | 公共行情（trades / orderbook）由 DataService 独占采集，下游只读 | DataService → `market:trades` / `quant:orderbook:*` |
+| **不为「没有人」建 seam** | 通用流式 bar→feature 链在出现第二个真实消费者前不建 | 延迟项（§八） |
+| **配置即代码** | 参数走 YAML + git + 重启，运行时只开关不改参 | 见 [HTTP §策略 API](../api/http.md) |
 
-| 原则 | 说明 | 在本系统中的体现 |
-|------|------|-----------------|
-| **事件驱动** | 服务间通过异步事件通信，不直接调用 | Redis Pub/Sub 事件链，`BaseEventService` 抽象 |
-| **策略可插拔** | 策略逻辑与执行引擎解耦 | `BaseStrategy` 接口，YAML 配置切换 |
-| **数据管线 / 交易管线分离** | 数据采集→特征计算 与 信号→风控→下单 独立运行 | 两条独立事件链，互不阻塞 |
-| **故障隔离** | 单服务崩溃不拖垮整个系统 | 独立进程/容器 + Redis 状态缓存 + 自动重启 |
-| **幂等恢复** | 服务重启后能从 Redis 缓存恢复状态 | 每个服务启动时从 Redis 加载最新状态 |
-| **配置驱动** | 所有参数通过 YAML + 环境变量注入 | Pydantic Settings + YAML config |
-| **单输入单输出** | tick 聚合为唯一数据源，下游只消费统一 Bar 契约 | Source Adapter 归一化 + `bar_normalized` 事件 |
-
-### 1.2 整体架构图
+## 三、拓扑：N 账户 = N 竖直栈 + 共享层 {#account-stacks}
 
 ```mermaid
 flowchart TD
-    subgraph dataPipeline ["数据管线 (Data Pipeline)"]
-        direction TB
-        DataSvc["DataService\n(trades + order book)"] -->|"写入 trades"| RedisStream["Redis Stream\n(market:trades)"]
-        DataSvc -->|"写入 order book"| RedisOrderbook["Redis String\n(quant:orderbook:*)"]
-        AssetPoolSvc["AssetPoolService"] -->|"写入"| RedisSet["Redis SET\n(quant:asset_pool:*)"]
-        RedisStream -->|"消费者组读取"| BarAdapter["BarSourceAdapterService\n(tick→bar聚合 + tick特征 + 统一Bar契约)\n支持 dollar_bar / time_bar"]
-        RedisSet -->|"读取 symbol 列表"| BarAdapter
-        BarAdapter -->|bar_normalized| FeatureService["Feature Service\n(ret/zscore/日级聚合/融合特征)"]
-        FeatureService -->|feature_calculated| outputData((" "))
+    subgraph shared ["共享层（单实例，账户无关）"]
+        Data["DataService（公共行情唯一所有者）\nmarket:trades(raw) + quant:orderbook:{sym}"]
+        Redis["Redis"]
+        DB["TimescaleDB"]
+        API["API 网关（账户感知）"]
+        Alert["Alert / Monitor（聚合各栈）"]
     end
 
-    subgraph tradingPipeline ["交易管线 (Trading Pipeline)"]
-        direction LR
-        StrategyService["Strategy Service"] -->|signal_generated| RiskService["Risk Service"]
-        RiskService -->|risk_approved| ExecutionService["Execution Service\n(订单簿/滑点/预算)"]
-        ExecutionService -->|execution_approved| OrderService["Order Service\n(纯执行)"]
-        RiskService -.->|risk_rejected| AlertPath((" "))
-        ExecutionService -.->|execution_rejected| AlertPath
-        OrderService -->|order_executed| AccountService["Account Service"]
+    subgraph stackA ["栈 A · 账户 A · 策略 6（ML, streaming）"]
+        S1["Strategy(A)[streaming]\n└插件: trades→美元bar→289特征→3×LGBM→hysteresis/CB"]
+        S1 --> R1["Risk(A)"] --> E1["Execution(A)"] --> O1["Order(A)"] --> Ac1["Account(A)"]
     end
 
-    subgraph infra ["基础设施层"]
-        Redis["Redis\n(Streams + Pub/Sub + 状态键)"]
-        TimescaleDB["TimescaleDB"]
-        Monitor["Monitor"]
-        APIGateway["API Gateway"]
+    subgraph stackB ["栈 B · 账户 B · 策略 5（A0, scheduler）"]
+        S2["Strategy(B)[scheduler]\n└self-feeding REST 日线 → 月度网格"]
+        S2 --> R2["Risk(B)"] --> E2["Execution(B)"] --> O2["Order(B)"] --> Ac2["Account(B)"]
     end
 
-    outputData --> StrategyService
-    RedisOrderbook -->|"按需读取"| ExecutionService
+    Data -->|"market:trades 消费者组"| S1
+    Data -->|"quant:orderbook:{sym}"| E1
+    Data -->|"quant:orderbook:{sym}"| E2
+    Ac1 & Ac2 --> API
+    R1 & R2 & O1 & O2 -. 拒绝/失败 .-> Alert
 ```
 
-### 1.2.1 关键约束
+§六（事件流）描述的是**单条栈内部**的链路；多栈即按此复制，键/频道各自带账户前缀。
 
-1. **DataService** 和 **AssetPoolService** 只负责往 Redis 写数据，不直接与下游服务通信。
-2. **BarSourceAdapterService** 从 Redis Stream 消费 tick 数据，支持 `dollar_bar`（按累计 dollar volume 切分）和 `time_bar`（按固定时间窗口切分）两种聚合模式，同时计算 tick 微观特征，输出统一 `Bar` 契约。
-3. 下游 `Feature/Strategy/Risk/Execution/Order` 不感知数据来源和 bar 类型，只消费 `bar_normalized`。
-4. **DataService** 是公共行情流（trades + order book + 未来可能的 ticker / kline）的唯一所有者；**AccountService** 是私有用户数据流（balance / positions / orders）的唯一所有者。两者使用独立的 ccxt.pro 连接和不同的 rate-limit 桶，互不干扰。
-5. **ExecutionService** 是介于 RiskService 与 OrderService 之间的执行质量网关，**不持有任何 WebSocket**，仅从 Redis 读取 DataService 写入的 `quant:orderbook:{symbol}` 做滑点 / 深度 / 预算检查。详见 §2.2.9。
+## 四、模块清单
 
-### 1.3 策略与执行解耦: BaseStrategy 抽象
+模块按「呈现给 caller 的 interface 有多少 leverage」组织，而不是按代码目录。
 
-**现有问题**: `FuturesOrderService` 将策略逻辑 (`_rank_by_momentum`) 和下单逻辑 (`_open_positions`, `_close_all_positions`) 耦合在同一个类中。无法独立测试策略、无法复用到回测、无法同时运行多策略。
+### 4.1 共享层（单实例）
 
-**解耦方案**: 引入 `BaseStrategy` 抽象接口，所有策略（包括 strategy_1 的 Top 10、strategy_4 的 rev_1d、strategy_3 的 ofi_14d）实现相同接口:
+| 模块 | interface（caller 需知道的） | 为什么 deep |
+|------|------------------------------|-------------|
+| **DataService** `data_service/` | watch 配置 → 持续写 `market:trades`(raw aggTrades) + `quant:orderbook:{sym}` 快照 | 一份订阅配置后面是连接管理、分批、重连、限频；下游只读全局键，不感知交易所 |
+| **API 网关** `controller/` | REST/WS over Redis+DB，按 `account` 路由 | 只读投影；contract 见 HTTP/WS 文档 |
+| **Alert / Monitor** | 订阅各栈 `risk_rejected`/`execution_rejected`/`order_failed` + 心跳扫描 → 报警历史 + Telegram | 全栈异常聚合的单一去处 |
+
+### 4.2 每栈模块（每账户一份，键空间 `quant:{account}:*`）
+
+| 模块 | interface | depth / 职责 |
+|------|-----------|--------------|
+| **Strategy** `strategy_service/` | 产出 **Target Portfolio**（见 §五）。两种形态见 §五 | 选股 + 方向 + 目标权重；**不做 USDT sizing**，不接收当前持仓 |
+| **Risk** `risk_service/` | `signal_generated`(Target Portfolio) → `risk_approved`(SizedPortfolio) / `risk_rejected` | **唯一**决定每仓 USDT 名义的地方：`\|weight\|×equity` + 总敞口上限 + minNotional 剔腿 + 急停/策略开关闸门。组合级约束全部 localize 在此 |
+| **Execution** `execution_service/` | `risk_approved` → `execution_approved`(带合约张数) / `execution_rejected` | 执行质量闸门：读 `quant:orderbook:{sym}`，新鲜度 + 盘口深度校验，`notional/mid_price→contracts`。逐腿独立校验 |
+| **Order** `order_service/` | `execution_approved` → 对**本账户净持仓**做 Target Portfolio 差量 → 下单；`order_executed`/`order_failed` | 差量（先平后开）+ 幂等（`rebalance_id`）+ dry-run + 重试 + 精度。差量与「完整目标」不变量的强制点 |
+| **Account** `account_service/` | 轮询交易所私有数据 → `quant:{account}:account:*` + portfolio NAV/PnL/回撤 | 本账户私有数据单一所有者；差量以本账户净持仓为基准 |
+
+### 4.3 横切模块（deepening 的两处核心）
+
+| 模块 | interface | 取代了什么 |
+|------|-----------|-----------|
+| **Keyspace（account-scoped Redis 入口）** | 服务说逻辑键名/频道名，Keyspace 注入 `quant:{account}:` 前缀；公共行情键直通不加前缀 | 取代「每个服务各自拼前缀」的散文约定（§六） |
+| **Target Portfolio** `domain/portfolio.py` | 「一个完整带符号权重的目标 + 对当前持仓 diff 出订单」 | 取代「每个策略各自记得发全量目标」的纪律 + Order 里散落的差量逻辑 |
+
+## 五、策略：两种形态 + Target Portfolio
+
+策略呈现给 StrategyService 的不是一个「带 mode 标志的大 interface」，而是**两个独立 interface**，共享只有「产出 Target Portfolio」+「生命周期/emit」这条窄 seam。新增策略只实现其中一种形态的完整 interface。
 
 ```python
-class BaseStrategy(ABC):
-    """所有策略必须实现此接口。回测和实盘共用同一套代码。"""
+# ---- 两种策略形态 ----
 
-    rebalance_interval: int = 1       # 换仓周期（交易日数），R1=1, R14=14
-    pool_name: str = "default"        # 使用的资产池名称
-    min_history_days: int = 0         # 最少历史天数要求（不足则过滤）
-
+class ScheduledStrategy(ABC):
+    """调度器按时点驱动（策略 5 A0）。self-feeding 者内部经 REST 自取数据。"""
+    pool_name: str = "default"
+    self_feeding: bool = False
     @abstractmethod
-    def generate_signal(
-        self,
-        features: Dict[str, FeatureVector],
-        timestamp: datetime,
-    ) -> StrategySignalBatch:
-        """输入特征 → 输出选股 + 方向（**不含仓位大小**）。
-
-        Sizing（每仓 USDT 名义金额）由 RiskService 负责计算；策略只回答
-        "买什么 / 买不买 / 做多还是做空"。策略是**无状态**的：不接收当前持仓，
-        hysteresis / turnover 控制一律由 RiskService 或 ExecutionService 处理。
-        """
-
-    def should_skip_rebalance(
-        self, n_candidates: int, cross_section_std: float
-    ) -> bool:
-        """子类可覆写，定义跳过换仓的条件。"""
+    def generate_signal(self, features, timestamp) -> "TargetPortfolio": ...
+    def should_skip_rebalance(self, n_candidates, cross_section_std) -> bool:
         return False
 
-# ---- Strategy → Risk ----（无 sizing 信息）
+class StreamingStrategy(ABC):
+    """自持流式循环（策略 6 ML）。消费 market:trades，内部聚合 bar/算特征/推理/持状态。"""
+    @abstractmethod
+    async def run_stream(self, emit) -> None: ...      # 每根 bar 调 emit(TargetPortfolio)
+    def snapshot_state(self) -> dict: return {}        # held / CB / bar 进度 → Redis
+    def restore_state(self, state: dict) -> None: ...  # 重启恢复
+    def state_view(self) -> dict: return {}            # 喂 GET /strategies/{name}/state
+
+# ---- 两种形态都产出的目标 ----
 
 @dataclass(frozen=True)
-class StrategySignal:
+class TargetLeg:
     symbol: str
-    side: str          # "long" | "short"
-    signal_value: float
-    reason: str        # 可读说明
-
-@dataclass
-class StrategySignalBatch:
-    signals: List[StrategySignal]
-    strategy_name: str
-    signal_timestamp: datetime
-    metadata: Dict[str, Any]  # n_candidates / long_count / short_count / skipped / cross_section_std
-
-# ---- Risk → Execution ----（USDT 名义金额；方向由 side 表达）
-
-@dataclass(frozen=True)
-class SizedPosition:
-    symbol: str
-    side: str                  # "long" | "short"
-    notional_usdt: float       # **始终为正数**，方向由 side 决定
+    side: str                 # "long" | "short"
+    target_weight: float      # 带符号 NAV 占比，如 -0.012 = 做空 1.2% 权益
     signal_value: float
     reason: str
 
 @dataclass
-class SizedPortfolio:
-    positions: List[SizedPosition]
+class TargetPortfolio:
+    """完整目标状态（永不增量）。这条不变量由本模块持有，不靠各策略自觉。"""
+    legs: list[TargetLeg]
     strategy_name: str
     signal_timestamp: datetime
-    sizing_metadata: Dict[str, Any]    # sizing_scheme / per_position_notional_usdt / total_notional_usdt / ...
-    strategy_metadata: Dict[str, Any]  # 透传 StrategySignalBatch.metadata
+    rebalance_id: str         # 确定性幂等键，贯穿全链
+    signal_type: str = "target_weight"
+    metadata: dict = field(default_factory=dict)
+
+    def diff(self, current_positions) -> list["OrderIntent"]:
+        """对当前持仓做差量，产出先平后开的订单意图。Order 模块消费此结果。"""
 ```
 
-> **V1 Sprint 1–3 状态**：RiskService 的 `_size_positions` 是**硬编码 stub**（`PLACEHOLDER_NOTIONAL_USDT = 100.0`），`sizing_metadata.sizing_scheme` 恒为 `"hardcoded_placeholder"`。Sprint 4 会替换为基于 `quant:account:balance`（`total_equity` / `available_balance`）的等权 / 信号加权 / 波动率目标方案，并配套 `sizing_scheme` / `equity_source` / `target_gross_exposure` / `max_position_notional_usdt` 等 yaml 字段。
+**状态约定**：策略**允许持有状态**，但若有状态必须经 `snapshot_state()/restore_state()` 持久化以支持重启恢复。
 
-**strategy_4 (rev_1d) 实现示例:**
+- ScheduledStrategy（策略 5）：每次从数据全量重推网格/止损/杠杆，天然无状态、无需持久化。
+- StreamingStrategy（策略 6）：hysteresis 仓位、组合回撤熔断（CB）是 alpha 的一部分、**不可搬到通用 Risk/Execution**，由策略自持并落 `quant:{account}:strategy:{name}:state`。
 
-```python
-class Rev1dStrategy(BaseStrategy):
-    """1d 价格反转策略, 对应 overview/strategy_4.md"""
+**两个策略对照：**
 
-    def __init__(self, long_n: int = 30, short_n: int = 30):
-        self.long_n = long_n
-        self.short_n = short_n
+| 维度 | 策略 6（账户 A，streaming） | 策略 5（账户 B，scheduler） |
+|------|----------------------------|----------------------------|
+| 研究稿 | `ML_BT/scripts/final`（SOTA A+++） | `新建文件夹/scripts/final_strategy`（A0_vt） |
+| 时钟 | 逐美元 bar | 每日 00:10 UTC |
+| 取数 | 流式消费 `market:trades` | self-feeding REST 日线 |
+| bar/特征 | 插件内部：美元 bar（钉死研究阈值）+ 289 因果特征 | 直接用日 K 线 |
+| 模型 | 3×shift LGBM（季度重训、热切换） | 无 |
+| 状态 | 有状态：hysteresis + CB（持久化） | 无状态（重推） |
+| 权重 | bang-bang `pos/N`→`target_weight`，CB 触发全平 | vol-target NAV 占比 |
+| L2 视图 | `ml_composite` | `grid_period` |
 
-    def generate_signal(self, features, timestamp):
-        scores = {}
-        for symbol, feat in features.items():
-            z1d = feat.get("zscore_neg_ret_1d")
-            if z1d is not None:
-                scores[symbol] = z1d
+## 六、事件流与 Redis 命名空间约定（权威）
 
-        ranked = sorted(scores.items(), key=lambda x: x[1])
-
-        batch_signals: list[StrategySignal] = []
-        for symbol, val in ranked[-self.long_n:]:
-            batch_signals.append(
-                StrategySignal(
-                    symbol=symbol, side="long",
-                    signal_value=val, reason="rev_1d_long",
-                )
-            )
-        for symbol, val in ranked[:self.short_n]:
-            batch_signals.append(
-                StrategySignal(
-                    symbol=symbol, side="short",
-                    signal_value=val, reason="rev_1d_short",
-                )
-            )
-        return StrategySignalBatch(
-            signals=batch_signals,
-            strategy_name="rev_1d",
-            signal_timestamp=timestamp,
-            metadata={"n_candidates": len(scores)},
-        )
-```
-
-注意示例中**没有 `weight` 计算**、**也没有 `current_positions` 参数**——仓位大小在 RiskService 阶段决定，策略本身是无状态的纯函数。
-
-**策略汇总表 (strategy_1 / strategy_4 / strategy_3):**
-
-所有策略共享相同的 `BaseStrategy` 接口，区别仅在 `generate_signal` 内部的信号构造逻辑、换仓周期和所用资产池:
-
-| 策略 | 来源 | 信号公式 | 所需特征 | 换仓 | 资产池 |
-|------|------|---------|---------|------|--------|
-| rev_x_inv_vpin | strategy_1 Top 1 | `mean(z2h,z4h) × clip(1 - 0.3·vpin_z, 0.3, 1.7)` | ret_2h, ret_4h, tick_vpin_24h | R1 | default |
-| rev_vpin_filter_t1.0 | strategy_1 Top 2/3 | `zscore_neg_ret_2h` 仅保留 `zscore_vpin > 1.0` | ret_2h, tick_vpin | R1 | default |
-| rev_jump_filter_t1.0 | strategy_1 Top 4/5 | `zscore_neg_ret_2h` 仅保留 `zscore_jump > 1.0` | ret_2h, tick_jump_ratio | R1 | default |
-| regime_switch | strategy_1 Top 7 | 高波做趋势, 低波做反转 | ret_2h, volatility | R1 | default |
-| rev_1d | strategy_4 | `-zscore(ret_1d, window=30)` | ret_1d | R1 | default |
-| ofi_14d | strategy_3 | `zscore(RM_14(ofi_d))` 截面多空 | ofi_d, ofi_14d, dollar_volume_d | R14 | t50_monthly |
-
-### 1.4 事件流设计 (完整)
-
-```mermaid
-flowchart TD
-    DataSvc["DataService\n(trades + order book)"] -->|"写入 Redis Stream"| RedisStream["market:trades"]
-    DataSvc -->|"覆盖写 Redis String"| RedisOrderbook["quant:orderbook:{symbol}"]
-    AssetPoolSvc["AssetPoolService"] -->|"写入 Redis SET"| RedisSet["quant:asset_pool:*"]
-    AssetPoolSvc -.->|asset_pool_updated| MonitorAlert
-
-    RedisStream -->|"消费者组"| BarAdapter["BarSourceAdapterService\n(tick→bar + tick特征 + 统一契约)"]
-    RedisSet -->|"读取 symbol 列表"| BarAdapter
-
-    BarAdapter -->|bar_normalized| FeatureSvc["FeatureService\n(融合特征 + zscore + 日级聚合)"]
-    FeatureSvc -->|feature_calculated| StrategySvc["StrategyService\n(多策略并行)"]
-    StrategySvc -->|signal_generated| RiskSvc["RiskService\n(组合级规则)"]
-    RiskSvc -->|risk_approved| ExecSvc["ExecutionService\n(订单簿/滑点/预算)"]
-    ExecSvc -->|execution_approved| OrderSvc["OrderService\n(差量下单, 纯执行)"]
-    RedisOrderbook -->|"按需读取"| ExecSvc
-    RiskSvc -.->|risk_rejected| MonitorAlert
-    ExecSvc -.->|execution_rejected| MonitorAlert
-    OrderSvc -->|order_executed| AccountSvc["AccountService"]
-    OrderSvc -.->|order_failed| MonitorAlert
-```
-### 1.5 故障隔离与恢复策略
-
-| 故障场景 | 隔离机制 | 恢复策略 |
-|---------|---------|---------|
-| 单服务崩溃 | 独立容器, ECS 自动重启 | 启动时从 Redis 加载 asset_pool / features / positions |
-| Redis 短暂不可用 | 指数退避重连 (BaseEventService 内置) | 重连后重新订阅, 从 Redis 恢复状态 |
-| 交易所 API 限频 | AccountService 统一调用, 其他服务读 Redis | 429 → 退避重试, 最多 3 次 |
-| 特征计算超时 | 单 symbol 超时不阻塞其他 symbol | 跳过该 symbol, 下轮重新计算 |
-| 下单失败 | OrderService 重试 3 次 + dry-run 模式 | 记录失败订单, emit order_failed 供 Monitor 告警 |
-| 策略信号异常 | RiskService 拦截 (最大仓位/最大敞口) | risk_rejected 事件 → 不下单 + 告警 |
-
-### 1.6 数据一致性保障
-
-**问题**: 事件驱动架构中, 服务重启可能丢失 Redis Pub/Sub 消息 (Pub/Sub 无持久化)。
-
-**解决方案 — 双保险机制:**
-
-1. **事件触发 (主路径)**: 正常运行时通过 Pub/Sub 实时触发
-2. **定时兜底 (备用路径)**: 每个服务维护 cron 定时器，即使错过事件也能按时执行
-   - AssetPoolService: 每 24h 更新
-   - StrategyService: 每日 23:59 UTC 触发 (对应 strategy_4 的 same_day 模式)
-   - OrderService: 兜底检查目标仓位 vs 实际仓位偏差
-
-3. **关键状态持久化到 Redis**:
-   - `quant:state:{service_name}:last_run` — 上次执行时间戳
-   - `quant:state:{service_name}:status` — running / idle / error
-   - 启动时检查 last_run, 若距今超过阈值则立即补执行
----
-
-## 二、目录结构与服务职责 {#directory-structure}
-
-### 2.1 目标目录树
-
-基于现有 `src/quant_trading/` 结构扩展。已有模块保留，新增模块用 `★` 标注。
+**单栈事件链**（频道均带账户前缀）：
 
 ```
-quant_trading_backend/
-├── yamls/                                # YAML 业务配置 (现有)
-│   ├── data.yaml                         # DataService 配置
-│   ├── account.yaml                      # AccountService 配置
-│   ├── exchange.yaml                     # 交易所通用配置
-│   ├── strategy_config.yaml              ★ 策略选择 + 参数
-│   ├── risk_config.yaml                  ★ 风控规则
-│   ├── execution_config.yaml             ★ 执行质量网关配置 (滑点/深度/预算)
-│   ├── monitor_config.yaml               ★ 告警阈值 + 渠道
-│   └── bar_source_config.yaml            ★ BarSourceAdapterService 配置 (bar 类型 + 阈值)
-│
-├── docker/
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── docker-compose.local.yml          # 本地开发
-│
-├── infra/                                ★ Terraform IaC
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   ├── terraform.tfvars.example
-│   └── modules/
-│       ├── vpc/                          ★ 网络
-│       ├── ecs/                          ★ ECS 集群 + 服务
-│       ├── redis/                        ★ ElastiCache
-│       ├── rds/                          ★ TimescaleDB on RDS
-│       ├── ecr/                          ★ 容器镜像仓库
-│       ├── secrets/                      ★ Secrets Manager
-│       ├── monitoring/                   ★ CloudWatch + SNS
-│       └── iam/                          ★ IAM 角色
-│
-├── src/quant_trading/
-│   ├── app/
-│   │   ├── cli.py                        # Typer CLI 入口
-│   │   └── commands/
-│   │       ├── _utils.py
-│   │       ├── account_service/          # CLI: account-service run
-│   │       ├── data_service/             # CLI: data-service run
-│   │       ├── configs/                  # CLI: configs list/generate/load
-│   │       ├── strategy_service/         ★ CLI: strategy-service run
-│   │       ├── risk_service/             ★ CLI: risk-service run
-│   │       ├── execution_service/        ★ CLI: execution-service run
-│   │       └── monitor_service/          ★ CLI: monitor-service run
-│   │
-│   ├── common/
-│   │   ├── configs/
-│   │   │   ├── paths.py                  # 配置路径管理
-│   │   │   ├── envs/                     # Pydantic 环境配置
-│   │   │   │   ├── base.py
-│   │   │   │   ├── loader.py
-│   │   │   │   └── services/             # account_env, database_env, exchange_env, global_env, redis_env
-│   │   │   └── yamls/                    # YAML 配置加载
-│   │   │       ├── base.py
-│   │   │       ├── loader.py
-│   │   │       └── services/             # account_yaml, exchange_yaml, data_yaml
-│   │   ├── redis/
-│   │   │   ├── base_service.py           # BaseEventService
-│   │   │   ├── channels.py               # Channels, RedisKeys
-│   │   │   ├── client.py                 # RedisClient
-│   │   │   └── pubsub.py                 # RedisPubSub, EventMessage
-│   │   └── utils/
-│   │       ├── config_loader.py
-│   │       └── loggers.py
-│   │
-│   ├── data/
-│   │   └── db/                           # SQLAlchemy + TimescaleDB
-│   │       ├── database.py               # DatabaseManager
-│   │       ├── models/                   # account_model, symbol_ohlcv_model, tick_model
-│   │       └── repositories/             # base, account, symbol_ohlcv
-│   │
-│   ├── services/
-│   │   ├── account_service/              # [现有] 账户状态同步
-│   │   │   └── service.py                # AccountService
-│   │   │
-│   │   ├── data_service/                 # [现有] 市场数据采集（行情+订单簿），只负责写入 Redis Stream
-│   │   │   └── service.py                # DataService
-│   │   │
-│   │   ├── feature_service/              # [现有] 特征计算
-│   │   │   ├── feature_calculator.py     # 基础技术指标
-│   │   │   ├── zscore_calculator.py      # Z-Score 标准化
-│   │   │   ├── intraday_features.py      # 日内特征
-│   │   │   └── service.py                # FeatureService
-│   │   │
-│   │   │
-│   │   ├── bar_source_adapter_service/   ★ [新增] Bar 聚合 + tick 特征 + 统一契约
-│   │   │   ├── __init__.py
-│   │   │   ├── dollar_bar_aggregator.py  # Dollar Bar 自适应阈值 + 聚合
-│   │   │   ├── time_bar_aggregator.py    # Time Bar 固定窗口聚合
-│   │   │   ├── tick_features.py          # VPIN / Kyle's Lambda 等 9 个微观特征
-│   │   │   ├── threshold_tracker.py      # auto_K50_ema 阈值管理
-│   │   │   └── service.py               # BarSourceAdapterService 主服务 (消费 Redis Stream)
-│   │   │
-│   │   ├── strategy_service/             ★ [新增] 策略引擎
-│   │   │   ├── __init__.py
-│   │   │   ├── base_strategy.py          # BaseStrategy 抽象
-│   │   │   ├── registry.py               # 策略注册表 (name → class)
-│   │   │   ├── strategies/
-│   │   │   │   ├── __init__.py
-│   │   │   │   ├── rev_1d.py             # strategy_4: 1d 反转
-│   │   │   │   ├── rev_x_inv_vpin.py     # strategy_1 Top 1
-│   │   │   │   ├── rev_vpin_filter.py    # strategy_1 Top 2/3
-│   │   │   │   ├── rev_jump_filter.py    # strategy_1 Top 4/5
-│   │   │   │   ├── rev_noise_boost.py    # strategy_1 Top 6
-│   │   │   │   ├── regime_switch.py      # strategy_1 Top 7
-│   │   │   │   ├── vol_weighted_blend.py # strategy_1 Top 8
-│   │   │   │   ├── quad_blend.py         # strategy_1 Top 9
-│   │   │   │   └── ofi_14d.py            ★ strategy_3: OFI 14d 动量
-│   │   │   ├── ensemble.py               ★ 多策略集成
-│   │   │   └── service.py
-│   │   │
-│   │   ├── risk_service/                 ★ [新增] 风控
-│   │   │   ├── __init__.py
-│   │   │   ├── risk_rules.py             # 风控规则引擎
-│   │   │   └── service.py
-│   │   │
-│   │   ├── execution_service/            ★ [新增] 执行质量网关 (滑点/深度/预算)
-│   │   │   ├── __init__.py
-│   │   │   ├── orderbook_reader.py       # 从 Redis 读 quant:orderbook:{symbol}
-│   │   │   ├── slippage_checker.py       # 基于订单簿深度估算滑点
-│   │   │   ├── depth_checker.py          # 深度充足性校验
-│   │   │   ├── budget_checker.py         # 单笔 / 组合预算校验
-│   │   │   └── service.py                # ExecutionService 主服务
-│   │   │
-│   │   ├── order_service/                ★ [新增] 纯执行层
-│   │   │   ├── __init__.py
-│   │   │   ├── position_differ.py        # 目标仓位 vs 当前仓位 差量计算
-│   │   │   └── order_executor.py         # 下单 + 重试 + 精度处理
-│   │   │
-│   │   ├── monitor_service/              ★ [新增] 监控告警
-│   │   │   ├── __init__.py
-│   │   │   ├── health_checker.py         # 心跳检查
-│   │   │   ├── alerter.py                # Webhook 告警 (Telegram)
-│   │   │   └── service.py
-│   │   │
-│   │   └── backtest_engine/              ★ [新增] 回测引擎
-│   │       ├── __init__.py
-│   │       ├── data_loader.py            # 加载历史数据
-│   │       ├── simulator.py              # 回测核心循环
-│   │       ├── fee_model.py              # 手续费模型
-│   │       ├── metrics.py                # Sharpe / MDD / Calmar
-│   │       └── report.py                 # 报告生成
-│   │
-│   ├── controller/
-│   │   ├── gateway/                      # FastAPI 网关
-│   │   │   ├── base.py                   # ServiceSpec, BaseServiceApp, ServiceApp
-│   │   │   └── specs.py                  # 各服务 App 定义
-│   │   ├── routes/
-│   │   │   └── account.py                # /api/v1/account/* (现有)
-│   │   └── schemas/
-│   │       ├── common.py                 # ApiResponse, PaginationParams
-│   │       └── account.py                # BalanceResponse, PositionItem 等
-│   │
-│   └── domain/                           # 领域模型
-│       ├── portfolio.py                  # StrategySignal / StrategySignalBatch / SizedPosition / SizedPortfolio
-│       └── features.py                   # FeatureVector 标准接口
-│
-└── tests/
-    ├── conftest.py                       # mock_redis_client 等 fixture
-    ├── services/
-    │   └── test_data_service.py
-    ├── common/configs/
-    │   ├── test_yaml_loader.py
-    │   └── test_env_loader.py
-    ├── unit/                             ★ 待补充
-    │   ├── test_strategies/
-    │   │   ├── test_rev_1d.py            ★
-    │   │   └── test_ofi_14d.py           ★
-    │   └── test_risk_rules.py            ★
-    └── integration/                      ★ 待补充
-        └── test_event_flow.py            ★
+Strategy ─signal_generated─▶ Risk ─risk_approved─▶ Execution ─execution_approved─▶ Order ─order_executed─▶ Account
+            │                  └─ risk_rejected ─▶ Alert          └─ execution_rejected ─▶ Alert    └─ order_failed ─▶ Alert
 ```
 
-### 2.2 各服务详细职责
+不变量：(1) 任何订单必先过 Risk；(2) Risk 拒绝不下单；(3) 同一 `rebalance_id` 不重复下单（幂等）；(4) 真实下单必先过 Execution 的深度/新鲜度校验。
 
-#### 2.2.1 Asset Pool Service (扩展 — 多池支持)
+**命名空间（Keyspace 模块强制，所有服务遵守）：**
 
-| 属性 | 值 |
-|------|-----|
-| **现有文件** | `services/asset_pool_service/service.py` |
-| **订阅事件** | 无 |
-| **发布事件** | `asset_pool_updated`（仅供 Monitor 监听，下游 BarSourceAdapterService 不订阅此事件，直接读 Redis SET） |
-| **职责** | **只负责筛选资产池并写入 Redis SET**，不与下游服务直接通信 |
-| **核心逻辑** | 支持多种 pool profile，按不同指标/周期筛选合约池，结果写入 Redis SET |
-| **调度** | `default` 池每 24h 更新; `t50_monthly` 池每月 1 日更新 |
-| **Redis 键** | `quant:asset_pool:{exchange}` (Set, default), `quant:asset_pool:{exchange}:t50_monthly` (Set) |
+- **账户作用域**键/频道一律 `quant:{account}:<逻辑名>`。例：`quant:acctA:signal_generated`、`quant:acctA:signal:latest`、`quant:acctB:account:balance`、`quant:acctA:strategy:strat6:state`。每条栈的服务只读写**本账户**命名空间。
+- **公共/全局**（账户无关，各栈共读）：`market:trades`、`quant:orderbook:{symbol}`、`quant:asset_pool:{exchange}`、`quant:system:emergency_stop`。
+- **心跳**：`quant:heartbeat:{service}@{account}`（含账户区分），共享层服务无 `@account` 后缀。
+- `{account}` 是稳定标识（`acctA`/`acctB` 或子账户 uid），由该栈 env（`.env.acctA`）注入，与子账户 API key 一一对应。
 
-**多池配置 (asset_pool_config.yaml 扩展):**
+**为什么用 Keyspace 模块而不是散落约定**：命名方案改一次到处生效（locality）；每个服务白拿正确 scoping（leverage）；对 Keyspace 测一次前缀正确性，而不是在每个服务 test 里断言前缀（interface 即 test surface）。两个 adapter（acctA/acctB）= 真 seam。
 
-```yaml
-pools:
-  default:
-    top_k: 100
-    metric: usdt_volume_30d
-    update_interval: 24h
-  t50_monthly:
-    top_k: 50
-    metric: dollar_volume_monthly   # 按月统计 sum(dollar_volume_d)
-    lag: 1                          # 使用上月数据 (1 个月滞后)
-    update_interval: monthly        # 每月 1 日更新
-    min_history_days: 60            # 历史不足 60 天的标的排除
-```
+**为什么不用虚拟账本**：物理分账户后，Order 差量直接对自己账户净持仓算，天然不会互踩——早期「同账户 + `quant:positions:strategy:{name}` 虚拟账本」方案整体取消，仅留作未来确需同账户混跑的可选回退。
 
-**月度流动性池 T50 计算逻辑 (对应 strategy_3.md Section 4.1):**
+## 七、数据层：公共行情
 
-```python
-def compute_monthly_pool(
-    daily_dollar_volumes: Dict[str, Dict[date, float]],
-    target_month: date,
-    top_k: int = 50,
-    min_history_days: int = 60,
-) -> List[str]:
-    """
-    按上月 dollar_volume 总和降序取 Top-K，
-    同时过滤历史不足 min_history_days 的标的。
-    """
-    monthly_totals = {}
-    for symbol, date_to_dv in daily_dollar_volumes.items():
-        month_days = [d for d in date_to_dv if d.month == target_month.month and d.year == target_month.year]
-        if len(date_to_dv) < min_history_days:
-            continue
-        monthly_totals[symbol] = sum(date_to_dv[d] for d in month_days)
-    ranked = sorted(monthly_totals.items(), key=lambda x: x[1], reverse=True)
-    return [sym for sym, _ in ranked[:top_k]]
-```
+DataService 是公共行情唯一所有者，按 `watch_mode` 写入：
 
-#### 2.2.2 BarSourceAdapterService (新增 — 合并原 DataIngestion + DollarBar + TickFeature)
+| 键 | 类型 | 内容 | 消费者 |
+|----|------|------|--------|
+| `market:trades` | Stream | raw aggTrades（含 `is_buyer_maker`/price/qty/ts，供策略算微观列） | 策略 6 插件（独立消费者组） |
+| `quant:orderbook:{symbol}` | String | 最新 L2 + mid_price + ts_ms（覆盖写） | 各栈 Execution（深度/新鲜度校验） |
 
-BarSourceAdapterService 是数据管线的核心聚合服务，从 Redis 拉取原始 tick 数据和资产池信息，完成 bar 聚合、tick 微观特征计算和统一 Bar 契约输出。
+为两策略，DataService 跑两种 watch_mode：`trades_raw`（策略 6 的 ~20 币）+ `orderbook`（两栈深度校验的并集；策略 5 的山寨腿盘口也可由 Execution 按需 REST 拉，不必常驻流）。
 
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/bar_source_adapter_service/` |
-| **数据输入** | Redis Stream `market:trades`（消费者组读取，由 DataService 写入）；Redis SET `quant:asset_pool:*`（确定需要聚合的 symbol 列表） |
-| **发布事件** | `bar_normalized` |
-| **Bar 类型** | 支持 `dollar_bar`（按累计 dollar volume 切分，阈值 auto_K50_ema 自适应）和 `time_bar`（按固定时间窗口切分，如 1m/5m/15m），通过配置切换 |
-| **tick 微观特征** | 在每根 bar 内计算 9 个特征：tick_vpin, tick_toxicity_run_mean/max/ratio, tick_kyle_lambda, tick_burstiness, tick_jump_ratio, tick_whale_imbalance/impact |
-| **输出** | 统一 Bar 契约（OHLCV + tick 微观特征 + buy_sell_imbalance 等），下游 FeatureService 无需感知 bar 类型 |
-| **性能要求** | 使用 NumPy/Polars 向量化，避免 Python 循环 |
-| **容量** | 488 symbols × ~250 ticks/s (峰值) ≈ 120K ticks/s |
-| **冷启动** | dollar_bar 模式：预加载最近 7 天 tick 生成种子 bar，确定初始阈值 |
+## 八、延迟项：通用流式 bar→feature 链（扩展点）
 
-**消费者组读取示例:**
+通用「DataService(trades)→BarSourceAdapter→FeatureService→`feature_calculated`」链**当前不建**：策略 5 是 REST self-feeding，策略 6 是自包含流式插件——两者都不消费它，零真实消费者。
 
-```python
-async def consume_trades(self):
-    stream_key = "market:trades"
-    group = "bar_source_consumers"
-    consumer = f"bar_source_{self.instance_id}"
+> **何时建**：出现**第二个**需要共享流式特征的策略时（例如一个流式横截面策略），此时才有真 seam（两个 adapter）。届时把 bar 聚合 + 特征计算从策略插件里抽到共享层，定义 `BarNormalized` 契约（仅含彼时真实生产/消费的字段，不预埋投机性 tick 列）。在此之前，streaming 策略自带 bar/特征。
 
-    try:
-        await self.redis.xgroup_create(stream_key, group, id="0", mkstream=True)
-    except Exception:
-        pass
+## 九、状态与故障恢复
 
-    while self._running:
-        messages = await self.redis.xreadgroup(
-            group, consumer,
-            streams={stream_key: ">"},
-            count=100,
-            block=1000,
-        )
-        for stream, entries in messages:
-            for msg_id, trade_data in entries:
-                symbol = trade_data["symbol"]
-                if symbol in self._active_symbols:
-                    self._process_trade(symbol, trade_data)
-                await self.redis.xack(stream_key, group, msg_id)
-```
-
-**配置 (bar_source_config.yaml):**
-
-```yaml
-bar_type: dollar_bar           # dollar_bar | time_bar
-
-dollar_bar:
-  initial_threshold: 50000     # 初始 dollar volume 阈值 (USD)
-  ema_window: 50               # auto_K50_ema 自适应窗口
-  min_ticks_per_bar: 10        # 最少 tick 数
-
-time_bar:
-  interval: 5m                 # 时间窗口 (1m / 5m / 15m / 1h)
-
-tick_features:
-  rolling_window: 50           # rolling bar 窗口大小
-  enabled: true                # 是否计算 tick 微观特征
-
-output_columns: 23             # 统一输出列数
-```
-
-#### 2.2.3 Feature Service (现有 + 扩展)
-
-| 属性 | 值 |
-|------|-----|
-| **现有文件** | `services/feature_service/service.py` |
-| **订阅事件** | `bar_normalized`（由 BarSourceAdapterService 发布） |
-| **发布事件** | `feature_calculated` |
-| **现有功能** | 基础技术指标 (SMA/EMA 等)、日内收益率 (intraday_features.py)、截面 Z-Score (zscore_calculator.py) |
-| **扩展功能** | 日级聚合 (daily_aggregator.py ★)、多日滚动特征 (rolling_features.py ★) |
-| **Redis 键** | `quant:features:latest:{symbol}`（保持）, `quant:features:{symbol}:{timestamp}`（保持）, `quant:features:daily:{symbol}` ★ |
-
-**日级聚合层 (daily_aggregator.py) — 对应 strategy_3.md Section 2.3/3.2:**
-
-Bar 级特征在每日 EOD (23:59 UTC) 聚合为日级特征，供中低频策略（如 ofi_14d）消费:
-
-| 日级字段 | 聚合公式 | 来源 |
-|---------|---------|------|
-| `close_d` | 当日最后一根 bar 的 `close` | bar OHLCV |
-| `ret_d` | `close_d / close_{d-1} - 1` | close_d |
-| `ofi_d` | 当日所有 bar `buy_sell_imbalance` 的均值 | Dollar Bar 23 列 |
-| `dollar_volume_d` | 当日所有 bar `dollar_volume` 之和 | Dollar Bar 23 列 |
-
-```python
-def aggregate_daily_features(
-    bars_today: List[BarNormalized],
-    prev_close: float,
-) -> DailyFeatures:
-    """将当日所有 bar 聚合为日级特征。"""
-    close_d = bars_today[-1].close
-    ret_d = close_d / prev_close - 1 if prev_close > 0 else float("nan")
-    ofi_d = np.nanmean([b.buy_sell_imbalance for b in bars_today])
-    dollar_volume_d = sum(b.dollar_volume for b in bars_today)
-    return DailyFeatures(close_d=close_d, ret_d=ret_d, ofi_d=ofi_d, dollar_volume_d=dollar_volume_d)
-```
-
-**多日滚动特征 (rolling_features.py) — 对应 strategy_3.md Section 3.3:**
-
-```python
-def rolling_mean(values: List[float], window: int = 14) -> float:
-    """
-    滚动均值，有效值条件: count_valid >= max(floor(w/2), 3)。
-    """
-    recent = values[-window:]
-    valid = [v for v in recent if not math.isnan(v)]
-    if len(valid) < max(window // 2, 3):
-        return float("nan")
-    return sum(valid) / len(valid)
-```
-
-`ofi_14d` 因子由 `rolling_mean(ofi_d_series, window=14)` 计算得出。
-
-**Z-Score 计算 (关键):**
-
-```python
-def calculate_zscore(values: List[float], window: int = 30, negate: bool = False) -> float:
-    """
-    时序 Z-Score, shift(1) 避免 look-ahead bias。
-    negate=True 用于反转信号: 价格跌 → zscore 正 → 做多。
-    """
-    if len(values) < window + 1:
-        return float("nan")
-    # shift(1): 只用截至前一根 bar 的数据
-    historical = values[-(window + 1):-1]
-    current = values[-1]
-    mean = sum(historical) / len(historical)
-    std = (sum((x - mean) ** 2 for x in historical) / len(historical)) ** 0.5
-    if std < 1e-10:
-        return 0.0
-    zscore = (current - mean) / std
-    return -zscore if negate else zscore
-```
-#### 2.2.7 Strategy Service (新增)
-
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/strategy_service/` |
-| **订阅事件** | `feature_calculated` |
-| **发布事件** | `signal_generated` |
-| **核心逻辑** | 加载配置中指定的策略, 调用 `generate_signal()`, 输出 `StrategySignalBatch`（只含选股 + 方向，不含 sizing；sizing 由 RiskService 做） |
-| **多策略支持** | StrategyRegistry 注册表 + ensemble 加权聚合 |
-| **调度** | 按策略独立换仓周期调度: R1 策略每日 23:59 UTC 触发, R14 策略每 14 个交易日触发 |
-| **资产池路由** | 根据策略配置的 `pool_name` 从对应的 Redis 池键读取候选标的 |
-
-**策略注册表设计:**
-
-```python
-class StrategyRegistry:
-    """通过 YAML 配置动态加载策略。"""
-    _registry: Dict[str, Type[BaseStrategy]] = {}
-
-    @classmethod
-    def register(cls, name: str):
-        def decorator(strategy_cls):
-            cls._registry[name] = strategy_cls
-            return strategy_cls
-        return decorator
-
-    @classmethod
-    def create(cls, name: str, **kwargs) -> BaseStrategy:
-        return cls._registry[name](**kwargs)
-
-# 使用:
-@StrategyRegistry.register("rev_1d")
-class Rev1dStrategy(BaseStrategy): ...
-
-@StrategyRegistry.register("rev_x_inv_vpin")
-class RevXInvVpinStrategy(BaseStrategy): ...
-
-@StrategyRegistry.register("ofi_14d")
-class Ofi14dStrategy(BaseStrategy): ...
-```
-
-**strategy_3 (ofi_14d) 实现示例:**
-
-```python
-@StrategyRegistry.register("ofi_14d")
-class Ofi14dStrategy(BaseStrategy):
-    """OFI 14 日动量策略, 对应 overview/strategy_3.md"""
-
-    rebalance_interval = 14
-    pool_name = "t50_monthly"
-    min_history_days = 60
-
-    def __init__(self, long_n: int = 15, short_n: int = 15, min_candidates: int = 30):
-        self.long_n = long_n
-        self.short_n = short_n
-        self.min_candidates = min_candidates
-
-    def generate_signal(self, features, timestamp):
-        scores = {}
-        for symbol, feat in features.items():
-            ofi_14d_value = feat.get("ofi_14d")
-            if ofi_14d_value is not None and not math.isnan(ofi_14d_value):
-                scores[symbol] = ofi_14d_value
-
-        if self.should_skip_rebalance(len(scores), self._cross_section_std(scores)):
-            return StrategySignalBatch(
-                signals=[], strategy_name="ofi_14d",
-                signal_timestamp=timestamp, metadata={"skipped": True},
-            )
-
-        ranked = sorted(scores.items(), key=lambda x: x[1])
-
-        batch_signals: list[StrategySignal] = []
-        for symbol, val in ranked[-self.long_n:]:
-            batch_signals.append(
-                StrategySignal(
-                    symbol=symbol, side="long",
-                    signal_value=val, reason="ofi_14d_long",
-                )
-            )
-        for symbol, val in ranked[:self.short_n]:
-            batch_signals.append(
-                StrategySignal(
-                    symbol=symbol, side="short",
-                    signal_value=val, reason="ofi_14d_short",
-                )
-            )
-        return StrategySignalBatch(
-            signals=batch_signals, strategy_name="ofi_14d",
-            signal_timestamp=timestamp, metadata={"n_candidates": len(scores)},
-        )
-
-    def should_skip_rebalance(self, n_candidates: int, cross_section_std: float) -> bool:
-        if n_candidates < self.min_candidates:
-            return True
-        if cross_section_std < 1e-10:
-            return True
-        return False
-
-    @staticmethod
-    def _cross_section_std(signals: Dict[str, float]) -> float:
-        if not signals:
-            return 0.0
-        values = list(signals.values())
-        mean_val = sum(values) / len(values)
-        return (sum((v - mean_val) ** 2 for v in values) / len(values)) ** 0.5
-```
-
-**StrategyService 灵活换仓调度:**
-
-```python
-class StrategyService:
-    def on_feature_calculated(self, features, timestamp):
-        trading_day_index = self._get_trading_day_index(timestamp)
-
-        for strategy_config in self.active_strategies:
-            strategy = StrategyRegistry.create(strategy_config.name, **strategy_config.parameters)
-            rebalance_interval = strategy.rebalance_interval
-
-            if trading_day_index > 0 and trading_day_index % rebalance_interval != 0:
-                continue
-
-            pool_symbols = self._load_pool(strategy.pool_name)
-            filtered_features = {s: features[s] for s in pool_symbols if s in features}
-            target = strategy.generate_signal(filtered_features, timestamp)
-            self.emit_signal(target)
-```
-
-**多策略集成配置 (strategy_config.yaml):**
-
-```yaml
-# 单策略模式
-mode: single
-active_strategy: rev_1d
-parameters:
-  long_n: 30
-  short_n: 30
-  rebalance_days: 1             # R1 = 每日换仓
-
-# 或: 多策略集成模式
-# mode: ensemble
-# ensemble_method: weighted_average
-# strategies:
-#   - name: rev_x_inv_vpin
-#     weight: 0.3
-#     pool: default
-#     rebalance_days: 1
-#     parameters: { long_n: 10, short_n: 10 }
-#   - name: rev_1d
-#     weight: 0.3
-#     pool: default
-#     rebalance_days: 1
-#     parameters: { long_n: 30, short_n: 30 }
-#   - name: ofi_14d
-#     weight: 0.4
-#     pool: t50_monthly
-#     rebalance_days: 14
-#     parameters:
-#       long_n: 15
-#       short_n: 15
-#       min_candidates: 30
-#       min_history_days: 60
-```
-
-#### 2.2.8 Risk Service (新增)
-
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/risk_service/` |
-| **订阅事件** | `signal_generated`（payload = `StrategySignalBatch`） |
-| **发布事件** | `risk_approved`（payload = `SizedPortfolio`） 或 `risk_rejected` |
-| **核心逻辑** | (1) 按 `reject_symbols` 过滤 signal；(2) 调用 `_size_positions` 给每个 signal 打 USDT 名义金额；(3) 组合级检查（Sprint 4）；(4) emit `SizedPortfolio` 到 `risk_approved`，同时覆盖写 `quant:risk:latest` |
-
-##### Position Sizing
-
-RiskService 是**唯一**决定"每个仓位分配多少 USDT"的地方。Strategy 只给出选股 + 方向，Execution 只负责用 `mid_price` 把 USDT 换成合约张数，中间的 sizing 逻辑集中在 Risk。
-
-**V1 Sprint 1–3 — 硬编码 stub**：
-
-```python
-PLACEHOLDER_NOTIONAL_USDT = 100.0  # risk_service/service.py
-
-def _size_positions(self, signals):
-    return [
-        SizedPosition(
-            symbol=s.symbol, side=s.side,
-            notional_usdt=PLACEHOLDER_NOTIONAL_USDT,  # 每个仓位固定 100 USDT
-            signal_value=s.signal_value, reason=s.reason,
-        )
-        for s in signals
-    ]
-```
-
-`sizing_metadata.sizing_scheme` 恒为 `"hardcoded_placeholder"`，`per_position_notional_usdt = 100.0`。这一阶段的目的是让 strategy → risk → execution 的**事件链和 schema** 先走通，真实 sizing 推迟到 Sprint 4。
-
-**V1 Sprint 4 — 计划实装**：
-
-1. 读 `quant:account:balance`（`total_equity` 或 `available_balance`，二选一，`equity_source` yaml 字段）。
-2. 按 `sizing_scheme` 决定每仓名义金额：
-   - `equal_notional`：`base_notional = target_gross_exposure × base_equity / n`
-   - `signal_proportional`：按 `|signal_value|` 归一化后分配
-   - `vol_target`：按目标波动率反比缩放
-3. 应用 `max_position_notional_usdt` cap（单仓上限）。
-4. 五个 `_check_*` 组合级检查（max_position / total_exposure / drawdown / reserve / turnover）基于 `SizedPortfolio` 做最后一道 gate；任意失败则 emit `risk_rejected`。
-
-**Sprint 4 预期 yaml 扩展**：
-
-```yaml
-# risk.yaml (Sprint 4)
-enabled: true
-always_approve: false
-reject_symbols: []
-
-sizing_scheme: equal_notional           # equal_notional | signal_proportional | vol_target
-equity_source: total_equity             # total_equity | available_balance
-target_gross_exposure: 1.0              # |long| + |short| 名义 占 base_equity 的比例
-max_position_notional_usdt: null        # 单仓 USDT 上限；null = 不限制
-
-# 组合级检查（Sprint 4 实装）
-max_drawdown_halt: 0.30
-min_balance_reserve: 100
-max_daily_turnover: 3.0
-```
-
-> **当前实现**：`risk.yaml` 只含 `enabled / always_approve / reject_symbols` 三个字段，不引入半成品的 sizing 配置；`PLACEHOLDER_NOTIONAL_USDT` 是模块常量，Sprint 4 同步引入完整 sizing yaml schema 时一起替换。
-
-#### 2.2.9 Execution Service (新增 — 执行质量网关)
-
-RiskService 只做**组合级**可行性检查（敞口、回撤、余额），不看订单簿。但当组合方案落到**单笔订单**时，仍可能因为滑点过大、深度不足或预算超限而执行质量糟糕。ExecutionService 是**介于 RiskService 与 OrderService 之间的执行质量网关**，在订单真正下到交易所之前做逐单级兜底。
-
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/execution_service/` |
-| **订阅事件** | `risk_approved`（原本由 OrderService 订阅，现改由 ExecutionService 接手）|
-| **发布事件** | `execution_approved` 或 `execution_rejected` |
-| **数据输入** | Redis String `quant:orderbook:{symbol}`（由 DataService 覆盖写入的最新 L2 订单簿快照）+ Redis `quant:account:*`（组合预算状态）|
-| **核心逻辑** | 对 `sized_portfolio` 中每个 `SizedPosition` 先用 `mid_price` 把 `notional_usdt` 折算成合约张数，再做**滑点 / 深度 / 预算** 三项检查，全部通过才 emit `execution_approved`；任一未通过则按 all-or-nothing 语义 emit `execution_rejected` |
-| **关键约束** | **不持有任何 WebSocket**、**不直接调用交易所**，仅读 Redis；ExecutionService 崩溃后可从空状态快速恢复，不依赖任何本地缓存 |
-| **配置文件** | `yamls/execution_config.yaml` |
-| **与 RiskService 的职责边界** | RiskService = **组合级** 可行性（max_position_pct / max_total_exposure / max_drawdown / min_balance_reserve / max_daily_turnover）; ExecutionService = **订单级** 可执行性（slippage / depth / single+portfolio budget）|
-
-**三项检查说明:**
-
-| 检查 | 判据 | 目的 |
+| 场景 | 隔离 | 恢复 |
 |------|------|------|
-| 滑点 (slippage) | 按订单簿逐档吃单估算实际成交均价，与 mid_price 的偏差 ≤ `max_slippage_bps` | 防止在薄订单簿上市价单被吃出严重偏差 |
-| 深度 (depth) | 前 N 档累计量 ≥ 订单量 × `min_depth_ratio` | 防止一笔订单把对手方深度全部吃穿，产生异常冲击 |
-| 预算 (budget) | 单笔金额 ≤ `single_order_max_usdt` 且组合本次换仓累计 ≤ `portfolio_budget_max_usdt` | 防止单次换仓因信号异常 / 计算错误产生超额下单 |
+| 单服务崩溃 | 独立进程/容器 | 启动从本账户 Redis 键恢复；streaming 策略 `restore_state()` + 回放近期 trades |
+| Redis 抖动 | BaseEventService 指数退避重连 | 重连重订阅，从 Redis 恢复 |
+| 交易所限频 | Account 统一私有调用、Data 统一公共调用 | 429 退避重试 |
+| 盘口深度不足/超龄 | Execution 拦截 | `execution_rejected` → 不下单 + 告警 |
+| 下单失败 | Order 重试 + 默认 dry-run | 记录 + `order_failed` 告警 |
 
-**主循环示例:**
+双保险：主路径 Pub/Sub 实时触发 + 每服务定时兜底（错过事件也按时执行）；关键状态落 `quant:{account}:state:{service}:*`，重启判补执行。
 
-```python
-class ExecutionService:
-    """从 risk_approved 消费，逐单做质量检查，全部通过才 emit execution_approved。
+## 十、模型服务与离线训练（策略 6）
 
-    输入 SizedPortfolio 中的每个 SizedPosition 只含 `notional_usdt`（USDT 名义金额，
-    始终为正）+ `side`。ExecutionService 读 `quant:orderbook:{symbol}.mid_price`
-    把 USDT 换成合约张数，再做滑点 / 深度 / 预算检查。
-    """
+- **离线**：季度 walk-forward 重训（≈ 研究侧 `scripts/final` 批处理），产出工件 = 3×shift LGBM + **每币美元 bar 阈值表** + **symbols 顺序（`sym_id` 映射）** + 特征列 + cutoff。
+- **在线**：策略插件加载当前 cutoff 模型，季度 rollover 热切换（保留 held，不空仓）。⚠️ `sym_id` 是 categorical，实盘 symbols 顺序必须与训练逐位一致 → 顺序是工件的一部分。
+- 详见 [策略 6](../overview/strategy_6.md)。
 
-    async def on_risk_approved(self, event: RiskApprovedEvent) -> None:
-        sized_portfolio = event.sized_portfolio
-        current_positions = await self.account_reader.load_positions()
-        # compute_deltas 现在对比 SizedPosition.notional_usdt 和当前持仓名义金额，
-        # 产出 (symbol, side, delta_notional_usdt) 三元组
-        deltas = compute_deltas(sized_portfolio, current_positions)
+## 十一、持久化
 
-        approved: list[CheckedOrder] = []
-        rejected: list[CheckedOrder] = []
-        portfolio_used_usdt = 0.0
+三张已实现表（`accounts` / `portfolio_snapshots` / `position_events`）+ 三张待建（`signal_records` / `rebalance_records` / `orders`），均带 `account_id` 维度。streaming 策略逐 bar 产信号，`signal_records` **仅在目标有效变更时写**（非每 bar），避免爆量。表结构见 [数据库设计](database.md)。
 
-        for delta in deltas:
-            orderbook = await self.orderbook_reader.read(
-                delta.symbol, max_age_ms=self.cfg.orderbook_max_age_ms
-            )
-            if orderbook is None:  # 超龄 / 缺失
-                rejected.append(CheckedOrder(delta, reasons=["stale_or_missing_book"]))
-                continue
+## 十二、部署 {#aws-deployment}
 
-            # USDT → 合约张数：只在这里做一次除法
-            amount = delta.delta_notional_usdt / orderbook.mid_price
+单机即可（两栈服务都很轻）：一台 EC2（东京）+ docker compose，或 ECS Fargate 每服务一个 task（共用镜像、command 区分）。每条栈用各自 `.env.acct{X}`（独立子账户 API key + `{account}` 标识）。密钥走 Secrets Manager（交易所 key/PEM、DB 密码、Telegram token）。
 
-            slippage_ok, slippage_bps = estimate_slippage(
-                delta.side, amount, orderbook, self.cfg.max_slippage_bps
-            )
-            depth_ok = check_depth(
-                delta.side, amount, orderbook, self.cfg.min_depth_ratio
-            )
-            # 预算检查直接用 notional_usdt，避免二次乘除
-            budget_ok = check_budget(
-                delta.delta_notional_usdt,
-                self.cfg.single_order_max_usdt,
-                portfolio_used_usdt,
-                self.cfg.portfolio_budget_max_usdt,
-            )
+各服务资源（256–1024 CPU / 512MB–2GB）：DataService 最重（WS 连接池），其余轻量；两栈 Risk/Execution/Order/Account 各两实例，翻倍成本可忽略。
 
-            if slippage_ok and depth_ok and budget_ok:
-                approved.append(CheckedOrder(
-                    delta, amount=amount, est_slippage_bps=slippage_bps,
-                ))
-                portfolio_used_usdt += delta.delta_notional_usdt
-            else:
-                reasons = []
-                if not slippage_ok:
-                    reasons.append(("slippage", slippage_bps))
-                if not depth_ok:
-                    reasons.append(("depth", None))
-                if not budget_ok:
-                    reasons.append(("budget", delta.delta_notional_usdt))
-                rejected.append(CheckedOrder(delta, reasons=reasons))
+通信选型：低频业务事件用 Redis Pub/Sub（at-most-once + 定时兜底足够）；公共行情高频流用 Redis Streams（消费者组 + ACK）。当前量级（≈120K ticks/s 峰值）Redis 单节点足够，不引入 Kafka。
 
-        # V1 采用 all-or-nothing 语义：任一拒绝则整批拒绝
-        if rejected:
-            self.emit_execution_rejected(event.rebalance_id, approved, rejected)
-        else:
-            self.emit_execution_approved(event.rebalance_id, approved)
-```
+## 十三、实现状态
 
-**三个独立 checker 的简化实现:**
-
-```python
-# slippage_checker.py
-def estimate_slippage(
-    side: str, amount: float, orderbook: dict, max_slippage_bps: int
-) -> tuple[bool, float]:
-    """按订单簿逐档吃单估算实际成交价，与 mid_price 对比算 bps。"""
-    book = orderbook["asks"] if side == "buy" else orderbook["bids"]
-    mid = (orderbook["asks"][0][0] + orderbook["bids"][0][0]) / 2
-    remaining = amount
-    cost = 0.0
-    for price, qty in book:
-        take = min(remaining, qty)
-        cost += take * price
-        remaining -= take
-        if remaining <= 0:
-            break
-    if remaining > 0:
-        return False, float("inf")  # 前 N 档总量不够吃单 → 滑点视为无穷
-    avg_price = cost / amount
-    slippage_bps = abs(avg_price - mid) / mid * 10000
-    return slippage_bps <= max_slippage_bps, slippage_bps
-
-
-# depth_checker.py
-def check_depth(
-    side: str, amount: float, orderbook: dict, min_depth_ratio: float
-) -> bool:
-    """前 10 档的累计量 >= 订单量 × min_depth_ratio。"""
-    book = orderbook["asks"] if side == "buy" else orderbook["bids"]
-    top_n_volume = sum(qty for _, qty in book[:10])
-    return top_n_volume >= amount * min_depth_ratio
-
-
-# budget_checker.py
-def check_budget(
-    order_value_usdt: float,
-    single_max_usdt: float,
-    portfolio_used_usdt: float,
-    portfolio_max_usdt: float,
-) -> bool:
-    """单笔上限 + 组合本次换仓累计上限。"""
-    return (
-        order_value_usdt <= single_max_usdt
-        and portfolio_used_usdt + order_value_usdt <= portfolio_max_usdt
-    )
-```
-
-**执行质量配置 (execution_config.yaml):**
-
-```yaml
-max_slippage_bps: 10                 # 最大允许滑点 (basis points, 10 bps = 0.1%)
-min_depth_ratio: 3.0                 # 前 10 档累计量至少是订单量的 3 倍
-orderbook_max_age_ms: 2000           # 订单簿快照最大新鲜度 (毫秒)
-reject_on_stale_book: true           # 订单簿超龄时是否直接拒绝
-single_order_max_usdt: 5000          # 单笔订单金额上限 (USDT)
-portfolio_budget_max_usdt: 50000     # 本次换仓的组合累计金额上限 (USDT)
-rejection_policy: all_or_nothing     # V1 推荐：任一拒绝则整批拒绝；可选 partial 放行通过的部分
-```
-
-**异常路径:**
-
-| 场景 | 行为 |
+| 模块 | 状态 |
 |------|------|
-| `quant:orderbook:{symbol}` 不存在或 TTL 超过 `orderbook_max_age_ms` | 整笔订单记为拒绝原因 `stale_or_missing_book`，按 `rejection_policy` 决定后续 |
-| 前 N 档深度不足以吃完订单量 | `estimate_slippage` 返回 `inf`，滑点检查失败 |
-| 单笔订单通过单笔预算但拖累组合预算超限 | budget 检查失败，reject 时注明当前 `portfolio_used_usdt` |
-| ExecutionService 本身崩溃 | 无状态恢复：重启后只消费新的 `risk_approved`，旧事件由 BaseEventService 的 last-run 兜底判断是否补执行 |
-
-#### 2.2.10 Order Service (重构)
-
-| 属性 | 值 |
-|------|-----|
-| **现有文件** | `services/order_service/futures_service.py` |
-| **变更** | 移除策略逻辑 (`_rank_by_momentum`), 只保留下单执行 |
-| **订阅事件** | `execution_approved`（由 ExecutionService 发布；不再直接订阅 `risk_approved`） |
-| **发布事件** | `order_executed` / `order_failed` |
-| **新增** | `position_differ.py` (差量计算), `order_executor.py` (重试 + 精度) |
-| **Dry-run** | 配置 `dry_run: true` 时只记录不实际下单 |
-
-**差量计算逻辑（已前移到 ExecutionService）:**
-
-```
-sized_portfolio.positions[].notional_usdt   (来自 RiskService via quant:risk:latest)
-    ÷ orderbook.mid_price                   (来自 DataService via quant:orderbook:{symbol})
-    = target_contracts (目标合约张数)
-
-target_contracts
-    - current_contracts                     (来自 AccountService via quant:account:positions)
-    = delta_orders (需要执行的订单列表)
-
-对每个 delta_order:
-    if delta > 0: buy
-    if delta < 0: sell
-    if delta ≈ 0: skip (低于最小下单量)
-```
-
-> **职责切分**：Strategy 不再接收 `current_positions`；差量计算在下游的 ExecutionService 完成（Sprint 4），OrderService 只负责下单执行。
-
-#### 2.2.11 Account Service (新增)
-
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/account_service/` |
-| **核心逻辑** | 定时轮询 (30s) 交易所 API, 同步余额/仓位/挂单到 Redis |
-| **发布事件** | `account_updated` |
-| **Redis 键** | `quant:account:balance`, `quant:account:positions`, `quant:account:orders` |
-| **设计要点** | 统一调用入口, 避免多个服务同时调用交易所 API 导致限频 |
-
-#### 2.2.12 Monitor Service (新增)
-
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/monitor_service/` |
-| **订阅事件** | 所有事件 (用于延迟检测) |
-| **核心功能** | 心跳检查、数据延迟告警、异常仓位检测、资金变动告警 |
-| **告警渠道** | Webhook → Telegram / DingTalk |
-
-**心跳机制:**
-
-```
-每个服务定期写入 Redis:
-    key = quant:heartbeat:{service_name}
-    value = { timestamp, status, metrics }
-    TTL = 120s
-
-Monitor Service 每 30s 扫描:
-    若某服务 heartbeat 过期 → 告警
-```
-
-#### 2.2.13 Backtest Engine (新增)
-
-| 属性 | 值 |
-|------|-----|
-| **新增文件** | `services/backtest_engine/` |
-| **核心原则** | 与实盘共用 BaseStrategy 代码, 策略无需感知回测 vs 实盘 |
-| **数据输入** | 从 Parquet / CSV / Redis 加载历史 kline 或 dollar bar |
-| **输出指标** | Sharpe, MDD, Calmar, 年化收益率, 换手率, NAV 曲线 |
-| **CLI** | `main backtest run --strategy rev_1d --start 2024-01-01 --end 2025-01-01` |
-
-**回测核心循环 (对应 overview/strategy_1.md Stage 6):**
-
-```python
-for date in all_trading_dates:
-    # 1. 计算当日 PnL (用旧权重)
-    daily_pnl = sum(weight[sym] * daily_return[sym] for sym in portfolio)
-
-    # 2. 在换仓日, 调用 strategy.generate_signal()
-    if is_rebalance_day(date, rebalance_interval):
-        features = feature_store.get_features(date)
-        target = strategy.generate_signal(features, current_weights, date)
-        turnover = sum(abs(target[sym] - current_weights[sym]) for sym in all_symbols)
-        daily_pnl -= turnover * fee_rate
-        current_weights = target
-
-    # 3. 更新 NAV
-    nav_curve.append(nav_curve[-1] * (1 + daily_pnl))
-```
-
-### 2.3 Redis 通道 / 键扩展清单
-
-**Pub/Sub 通道 (在 `channels.py` 中扩展):**
-
-| 通道 | 发布者 | 订阅者 |
-|------|-------|-------|
-| `quant:asset_pool_updated` | AssetPoolService | MonitorService（BarSourceAdapterService 不订阅，直接读 Redis SET） |
-| `quant:bar_normalized` | BarSourceAdapterService | FeatureService |
-| `quant:feature_calculated` | FeatureService | StrategyService |
-| `quant:signal_generated` | StrategyService | RiskService |
-| `quant:risk_approved` | RiskService | ExecutionService |
-| `quant:risk_rejected` | RiskService | MonitorService |
-| `quant:execution_approved` | ExecutionService | OrderService |
-| `quant:execution_rejected` | ExecutionService | MonitorService |
-| `quant:order_executed` | OrderService | AccountService, MonitorService |
-| `quant:order_failed` | OrderService | MonitorService |
-| `quant:order_rebalanced` | OrderService | MonitorService |
-| `quant:account_updated` | AccountService | RiskService |
-
-**Redis 键:**
-
-| 键模式 | 类型 | 用途 |
-|-------|------|------|
-| `market:trades` | Stream | DataService 写入 tick 数据，BarSourceAdapterService 消费者组读取 (MAXLEN ~100000) |
-| `market:tickers` | Stream | DataService 写入聚合行情快照 |
-| `market:ohlcv` | Stream | DataService 写入 K 线数据 |
-| `market:orderbook` | Stream | DataService 写入订单簿快照 (bids/asks JSON，深度由 `orderbook_depth_limit` 控制) |
-| `quant:orderbook:{symbol}` | String (JSON) | ★ DataService 覆盖写入的最新 L2 订单簿快照 (bids/asks + mid_price + ts_ms)，ExecutionService 按需读取做滑点/深度检查 |
-| `quant:bar:normalized:{symbol}:{timeframe}` | String (JSON) | 统一 Bar 快照 (BarSourceAdapterService 输出) |
-| `quant:asset_pool:{exchange}:t50_monthly` | Set | ★ T50 月度流动性池 |
-| `quant:features:daily:{symbol}` | String (JSON) | ★ 日级聚合特征缓存 (ofi_d, dollar_volume_d 等) |
-| `quant:features:rolling:{symbol}` | String (JSON) | ★ 多日滚动特征缓存 (ofi_14d 等) |
-| `quant:kline:{symbol}:{timeframe}` | String (JSON) | Kline 数据缓存 |
-| `quant:account:balance` | String (JSON) | 账户余额快照 |
-| `quant:account:positions` | String (JSON) | 当前持仓快照 |
-| `quant:account:orders` | String (JSON) | 活跃挂单快照 |
-| `quant:positions` | String (JSON) | 策略当前仓位 |
-| `quant:portfolio:snapshot` | String (JSON) | NAV / PnL / 回撤等组合指标快照 |
-| `quant:signal:latest` | String (JSON) | 最新策略信号快照（`StrategySignalBatch`，**不含** sizing） |
-| `quant:risk:latest` | String (JSON) | 最新风控后的目标组合（`SizedPortfolio`，USDT 名义金额） |
-| `quant:strategy:state:crypto_pairs_mean_reversion` | String (JSON) | crypto pairs 事件驱动策略运行时状态 |
-| `quant:strategy:crypto_pairs:segments` | String (JSON) | 导入的 frozen pair segment 快照 |
-| `quant:heartbeat:{service}` | String (JSON + TTL) | 服务心跳 |
-| `quant:state:{service}:last_run` | String | 上次执行时间戳 |
-| `quant:state:{service}:status` | String | 服务状态 (running / idle / error) |
-| `quant:risk:status` | String | 风控总体状态 |
-| `quant:risk:disabled_symbols` | String | 风控禁止交易的 symbols |
-| `quant:system:emergency_stop` | String | 全局紧急停止开关 |
-
----
-## 三、AWS 部署方案 {#aws-deployment}
-
-### 3.1 是否使用 Terraform?
-
-**结论: 是, 推荐使用 Terraform 管理所有 AWS 基础设施。**
-
-| 维度 | 不用 Terraform (现状) | 使用 Terraform |
-|------|---------------------|---------------|
-| 环境一致性 | 手动创建, 易出错 | 代码即基础设施, 可重复部署 |
-| 多环境支持 | 难以维护 staging / prod | `terraform workspace` 切换 |
-| 变更追踪 | 无法审计 | Git 版本控制 + `terraform plan` 预览 |
-| 灾难恢复 | 需要手工重建 | `terraform apply` 一键恢复 |
-| 团队协作 | 口口相传 | 代码 Review + CI 自动化 |
-| 学习成本 | 低 | 中等 (一次性投入) |
-
-**当前项目已有** ECS Fargate + ECR + GitHub Actions CI/CD, Terraform 可以将这些资源编码化。
-
-### 3.2 是否使用多节点?
-
-**结论: 多服务、单集群、按需扩缩。**
-
-不建议 "多节点" (多 EC2 集群), 而是继续使用 **ECS Fargate** — 每个服务是独立的 ECS Service (独立 Task Definition), 共享一个 ECS Cluster。Fargate 自动管理底层节点, 无需手动运维 EC2。
-
-**各服务资源配置建议:**
-
-| 服务 | CPU | Memory | 实例数 | 说明 |
-|------|-----|--------|--------|------|
-| Data Service | 1024 | 2 GB | 1 | 高吞吐, WebSocket 连接池, 写入 Redis Stream |
-| Asset Pool Service | 256 | 512 MB | 1 | 低频, 每 24h 执行一次, 写入 Redis SET |
-| BarSourceAdapterService | 1024 | 2 GB | 1 | 从 Redis Stream 消费 tick, bar 聚合 + tick 特征计算 |
-| Feature Service | 512 | 1 GB | 1 | |
-| Strategy Service | 256 | 512 MB | 1 | 轻量计算 |
-| Risk Service | 256 | 512 MB | 1 | 组合级规则检查 |
-| Execution Service | 256 | 512 MB | 1 | 逐单滑点/深度/预算检查，仅读 Redis |
-| Order Service | 256 | 512 MB | 1 | API 调用 |
-| Account Service | 256 | 512 MB | 1 | 定时轮询 |
-| Monitor Service | 256 | 512 MB | 1 | 心跳检查 |
-| API Gateway | 512 | 1 GB | 1-2 | 按访问量扩 |
-| **总计** | | | **11-12** | Fargate 按使用计费 |
-
-**月费估算 (ap-southeast-1):**
-
-```
-ECS Fargate:
-  11 tasks × 平均 0.5 vCPU × 1 GB × 730h ≈ $33-50/月
-
-ElastiCache Redis (cache.t3.small):
-  ≈ $25/月
-
-RDS TimescaleDB (db.t3.small):
-  ≈ $30/月 (含 20GB GP3 存储)
-
-NAT Gateway:
-  ≈ $35/月 (固定) + 数据传输费
-
-ECR:
-  < $5/月
-
-CloudWatch:
-  ≈ $10/月
-
-总计: ≈ $140-160/月
-```
-
-### 3.3 网络架构
-
-```mermaid
-flowchart TD
-    subgraph VPC ["VPC (10.0.0.0/16)"]
-        subgraph publicSubnet ["Public Subnet (10.0.1.0/24)"]
-            NAT["NAT Gateway"]
-            ALB["ALB (可选)"]
-        end
-        subgraph privateSubnet ["Private Subnet (10.0.10.0/24)"]
-            ECS1["ECS Fargate\nService 1"]
-            ECS2["ECS Fargate\nService 2"]
-            ECSn["... 所有服务"]
-        end
-        subgraph dataSubnet ["Data Subnet (10.0.20.0/24)"]
-            RedisNode["ElastiCache\nRedis"]
-            RDS["RDS\nTimescaleDB"]
-        end
-    end
-
-    Internet(("Internet")) --> ALB
-    ALB -->|8000| ECS1
-    ECS1 --> RedisNode
-    ECS1 --> RDS
-    ECS1 -->|via NAT| Internet
-    ECS2 --> RedisNode
-    ECS2 --> RDS
-```
-
-**安全组规则:**
-
-| 组 | 入站 | 出站 |
-|----|------|------|
-| ECS Services | 仅 ALB (8000 端口) | Redis (6379), TimescaleDB (5432), 互联网 (via NAT) |
-| Redis | 仅 ECS SG (6379) | 无 |
-| TimescaleDB | 仅 ECS SG (5432) | 无 |
-
-### 3.4 密钥管理
-
-**现有问题**: API Key 和 Private Key 通过 `.env` 文件和环境变量传递, 存储在 `configs/` 目录中。
-
-**生产方案**: AWS Secrets Manager
-
-```
-secrets/
-  quant/exchange/api_key         → EXCHANGE_API_KEY
-  quant/exchange/private_key     → EXCHANGE_PRIVATE_KEY (PEM 内容)
-  quant/db/password              → DB_PASSWORD
-  quant/telegram/bot_token       → TELEGRAM_BOT_TOKEN (告警用)
-```
-
-ECS Task Definition 通过 `secrets` 字段引用:
-
-```json
-{
-  "containerDefinitions": [{
-    "secrets": [
-      { "name": "EXCHANGE_API_KEY", "valueFrom": "arn:aws:secretsmanager:...:quant/exchange/api_key" },
-      { "name": "EXCHANGE_PRIVATE_KEY", "valueFrom": "arn:aws:secretsmanager:...:quant/exchange/private_key" }
-    ]
-  }]
-}
-```
-
-### 3.5 CI/CD 流程 (扩展)
-
-现有的 GitHub Actions workflow 只部署单容器。扩展为多服务部署（每个服务独立的 ECS Task Definition，但共用同一个 Docker 镜像，区别仅在 command 参数不同）:
-
-```mermaid
-flowchart LR
-    Push["main branch push"] --> GHA["GitHub Actions"]
-    GHA --> Build["Build Docker Image\n+ Push to ECR"]
-    Build --> D1["data-service\n(data run)"]
-    Build --> D2["asset-pool-service\n(trading asset-pool)"]
-    Build --> D3["bar-source-adapter\n(bar-source run)"]
-    Build --> D4["feature-service\n(trading feature)"]
-    Build --> D5["strategy-service\n(trading strategy)"]
-    Build --> D6["risk-service\n(trading risk)"]
-    Build --> D7["execution-service\n(trading execution)"]
-    Build --> D8["order-service\n(trading futures)"]
-    Build --> D9["account-service\n(trading account --daemon)"]
-    Build --> D10["monitor-service\n(trading monitor)"]
-    Build --> D11["api-gateway\n(system server)"]
-```
-
-### 3.6 Terraform 模块结构
-
-```
-infra/
-├── main.tf                 # Root module, 组合所有子模块
-├── variables.tf            # 全局变量 (region, env, project_name)
-├── outputs.tf              # 输出值 (ALB DNS, Redis endpoint 等)
-├── terraform.tfvars.example
-├── backend.tf              # S3 + DynamoDB 远端状态
-│
-└── modules/
-    ├── vpc/
-    │   ├── main.tf         # VPC, subnets, NAT, IGW, route tables
-    │   ├── variables.tf
-    │   └── outputs.tf
-    │
-    ├── ecr/
-    │   ├── main.tf         # ECR repository
-    │   └── ...
-    │
-    ├── ecs/
-    │   ├── main.tf         # ECS Cluster
-    │   ├── services.tf     # 每个服务的 Task Definition + Service
-    │   ├── iam.tf          # Task execution role, task role
-    │   └── ...
-    │
-    ├── redis/
-    │   ├── main.tf         # ElastiCache Redis cluster
-    │   └── ...
-    │
-    ├── rds/
-    │   ├── main.tf         # RDS PostgreSQL (TimescaleDB AMI)
-    │   └── ...
-    │
-    ├── secrets/
-    │   ├── main.tf         # Secrets Manager entries
-    │   └── ...
-    │
-    └── monitoring/
-        ├── main.tf         # CloudWatch Log Groups, Alarms, SNS
-        └── ...
-```
-
-**Root module 示例 (main.tf):**
-
-```hcl
-module "vpc" {
-  source = "./modules/vpc"
-  project_name = var.project_name
-  environment  = var.environment
-}
-
-module "redis" {
-  source     = "./modules/redis"
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.data_subnet_ids
-  security_group_ids = [module.vpc.redis_sg_id]
-}
-
-module "rds" {
-  source     = "./modules/rds"
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.data_subnet_ids
-  security_group_ids = [module.vpc.rds_sg_id]
-}
-
-module "ecs" {
-  source     = "./modules/ecs"
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnet_ids
-  redis_endpoint = module.redis.endpoint
-  db_endpoint    = module.rds.endpoint
-  ecr_repo_url   = module.ecr.repository_url
-}
-```
-
----
-
-## 四、通信总线选型: Redis vs Kafka {#message-bus}
-
-### 4.1 系统内的通信类型分析
-
-本系统存在两类截然不同的通信模式:
-
-| 类型 | 吞吐量 | 延迟要求 | 消息大小 | 持久化需求 | 示例 |
-|------|--------|---------|---------|-----------|------|
-| **高频数据流** | 高 (120K msg/s 峰值) | 低 (<100ms) | 小 (~200B) | 短期 (几小时) | aggTrade tick 数据 |
-| **低频事件** | 低 (<10 msg/min) | 中 (<1s) | 中 (~1KB) | 不需要 | feature_calculated, signal_generated |
-
-### 4.2 Redis vs Kafka 对比
-
-| 维度 | Redis Pub/Sub | Redis Streams | Apache Kafka |
-|------|--------------|---------------|-------------|
-| **消息模型** | 发布/订阅, fire-and-forget | 日志型, 持久化, 消费者组 | 日志型, 持久化, 消费者组 |
-| **消息持久化** | 无 (订阅者不在线则丢失) | 有 (MAXLEN 限制) | 有 (可配置保留期) |
-| **吞吐量** | ~100K msg/s (单节点) | ~100K msg/s (单节点) | ~1M msg/s (集群) |
-| **延迟** | <1ms | <2ms | 5-15ms |
-| **运维复杂度** | 极低 (已部署) | 低 (复用 Redis) | 高 (ZooKeeper/KRaft + Broker) |
-| **AWS 托管成本** | ElastiCache 包含 | ElastiCache 包含 | MSK ~$200-400/月 (最小集群) |
-| **消费者组** | 不支持 | 支持 (XREADGROUP) | 支持 |
-| **消息回放** | 不支持 | 支持 (从指定 ID 开始读) | 支持 (从指定 offset 读) |
-| **背压处理** | 无 (慢消费者被跳过) | MAXLEN 自动裁剪 | 消费者自主控制 |
-| **社区生态** | 成熟 | 成熟 | 非常成熟 |
-
-### 4.3 推荐方案
-
-```mermaid
-flowchart TD
-    subgraph highFreq ["高频数据层: Redis Streams"]
-        aggTrade["aggTrade tick 数据"] -->|"120K msg/s"| Stream["Redis Stream\n(quant:stream:aggTrades)"]
-        Stream -->|消费者组| DollarBarConsumer["DollarBarService"]
-    end
-
-    subgraph lowFreq ["低频事件层: Redis Pub/Sub"]
-        Events["asset_pool_updated\nfeature_calculated\nsignal_generated\nrisk_approved ..."]
-        Events -->|"<10 msg/min\n广播模式"| PubSub["Redis Pub/Sub\n(BaseEventService)"]
-    end
-
-    subgraph notUsed ["暂不引入"]
-        Kafka["Apache Kafka\n(详见 4.4)"]
-    end
-```
-
-### 4.4 为什么暂不引入 Kafka?
-
-| 考虑因素 | 分析 |
-|---------|------|
-| **数据量级** | 488 symbols × ~250 ticks/s (峰值) ≈ 120K msg/s。Redis Streams 在单节点即可轻松处理这个量级。Kafka 的优势在百万级 msg/s 才凸显。 |
-| **运维成本** | Kafka 需要 ZooKeeper/KRaft 集群 + 多 Broker。AWS MSK 最小 3 节点, 月费 $200-400。Redis 已经部署, Streams 功能零额外成本。 |
-| **团队规模** | 目前是小团队 / 个人项目。Kafka 的运维、调优、监控需要投入大量精力。Redis 几乎零运维。 |
-| **消息语义** | 本系统的低频事件不需要 exactly-once 语义。at-most-once (Pub/Sub) + 定时兜底 已经足够。高频数据层用 Streams 的 at-least-once 即可。 |
-| **已有投入** | 现有 `BaseEventService` + `RedisPubSub` 已经稳定运行。替换为 Kafka 需要重写所有服务的通信层。|
-| **延迟** | Redis (<2ms) 优于 Kafka (5-15ms)。对于量化交易, 更低的延迟是优势。|
-
-### 4.5 Redis Streams 的使用方式
-
-**高频数据链路: DataIngestionService → DollarBarService**
-
-```python
-# DataIngestionService: 写入 Redis Stream
-async def write_to_stream(self, symbol: str, trade: dict):
-    stream_key = "market:trades"
-    await self.redis.xadd(
-        stream_key,
-        trade,
-        maxlen=100000,      # 自动裁剪, 防止内存膨胀
-        approximate=True,   # 近似裁剪, 性能更好
-    )
-
-# DollarBarService: 消费者组读取
-async def consume_trades(self, symbol: str):
-    stream_key = "market:trades"
-    group = "dollar_bar_consumers"
-    consumer = f"dollar_bar_{symbol}"
-
-    # 创建消费者组 (幂等)
-    try:
-        await self.redis.xgroup_create(stream_key, group, id="0", mkstream=True)
-    except Exception:
-        pass  # 组已存在
-
-    while self._running:
-        messages = await self.redis.xreadgroup(
-            group, consumer,
-            streams={stream_key: ">"},  # 只读新消息
-            count=100,                  # 批量读取
-            block=1000,                 # 阻塞等待 1s
-        )
-        for stream, entries in messages:
-            for msg_id, trade_data in entries:
-                self._process_trade(symbol, trade_data)
-                await self.redis.xack(stream_key, group, msg_id)
-```
-
-### 4.6 何时迁移到 Kafka?
-
-如果未来遇到以下任一情况, 可考虑引入 Kafka:
-
-| 触发条件 | 说明 |
-|---------|------|
-| Redis 内存超过 8GB | aggTrade 数据量过大, Redis Streams 占用内存过多 |
-| 需要多天消息回放 | Redis Streams 的 MAXLEN 限制了回放窗口 |
-| 多系统消费同一数据 | 如需要同时供给回测系统 / 风控系统 / 监控系统 |
-| 吞吐突破 500K msg/s | Redis 单节点的吞吐上限 |
-| 需要 exactly-once 语义 | 对订单相关事件的严格要求 |
-
-**迁移路径:**
-1. 先在高频数据链路 (aggTrade → Dollar Bar) 替换 Redis Streams → Kafka
-2. 低频事件链路保持 Redis Pub/Sub 不变
-3. 为 `BaseEventService` 增加 Kafka backend 适配器, 上层服务代码无需修改
-
----
-
-## 附录 A: 策略兼容性矩阵 {#appendix-a}
-
-本架构同时兼容 strategy_4 (rev_1d)、strategy_1 (Top 10 多因子)、strategy_3 (ofi_14d) 和 `crypto_pairs_mean_reversion`:
-
-| 数据/特征需求 | strategy_4 (rev_1d) | strategy_1 (Top 10) | strategy_3 (ofi_14d) | crypto_pairs_mean_reversion | 提供服务 |
-|-------------|:---:|:---:|:---:|:---:|------|
-| 资产池筛选 (default Top-100) | ✅ | ✅ | ❌ | frozen pair symbol union | AssetPoolService → Redis SET |
-| 月度流动性池 (T50) | ❌ | ❌ | ✅ | ❌ | AssetPoolService → Redis SET |
-| Tick 采集写入 Redis Stream | ✅ | ✅ | ✅ | ✅ | DataService → Redis Stream |
-| Bar 聚合 (dollar_bar) | ✅ | ✅ | ✅ (buy_sell_imbalance) | ❌ | BarSourceAdapterService |
-| Bar 聚合 (time_bar) | ✅ | ✅ | ❌ | ✅ (1m → 策略内 resample) | BarSourceAdapterService |
-| Tick 微观特征 (9 个) | ❌ | ✅ (Top 1-7) | ❌ | ❌ | BarSourceAdapterService |
-| 日内 ret (1d) | ✅ | ✅ | ❌ | ❌ | FeatureService |
-| close passthrough | ❌ | ❌ | ❌ | ✅ | FeatureService |
-| 日级聚合 (ofi_d, dollar_volume_d) | ❌ | ❌ | ✅ | ❌ | FeatureService (扩展) |
-| 多日滚动特征 (ofi_14d) | ❌ | ❌ | ✅ | ❌ | FeatureService (扩展) |
-| Z-Score 标准化 | ✅ | ✅ | ✅ (截面) | spread z-score (strategy) | FeatureService / StrategyService |
-| 历史长度过滤 (≥60 天) | ❌ | ❌ | ✅ | 离线 research import | AssetPoolService / StrategyService |
-| 灵活换仓周期 | R1 | R1 | R14 | event-driven pair spread | StrategyService |
-| 多策略并行 | 单策略 | 多策略集成 | 可独立或集成 | 单策略 dry-run ready | StrategyService |
-| 风控检查 (组合级) | ✅ | ✅ | ✅ | pair leg sizing | RiskService |
-| 滑点 / 深度 / 预算检查 (订单级) | ✅ | ✅ | ✅ | ✅ | ExecutionService |
-| 市价单执行 | ✅ | ✅ | ✅ | 暂不启用真实下单 | OrderService |
-
-**分阶段实施:**
-
-| 阶段 | 可运行的策略 | 需要的服务 |
-|------|-----------|-----------|
-| **V1 Sprint 1** (最短闭环) | strategy_4 (rev_1d) | Data + AssetPool + BarSourceAdapterService + Feature + Strategy + Risk + Order（dry-run）|
-| **V1 Sprint 4** (执行可靠性) | 同上 | 上一行 + **ExecutionService**（插入 Risk 与 Order 之间做滑点/深度/预算检查）|
-| **V1.5** (可选扩展) | V1 + strategy_3 (ofi_14d) | V1 + AssetPool 多池扩展 + FeatureService 日级聚合 |
-| **Pairs dry-run** | crypto_pairs_mean_reversion | Data + AssetPool + BarSourceAdapterService(1m time_bar) + Feature(close passthrough) + Strategy(event-driven) + Risk(pair sizing) + Execution(depth check) |
-| **V2** (全量多因子) | strategy_1 + strategy_4 + strategy_3 全部 | V1 + BarSourceAdapterService tick 特征启用 + 多策略集成 |
-
-## 附录 B: Terraform 模块清单 {#appendix-b}
-
-| 模块 | 资源 | 关键参数 |
-|------|------|---------|
-| `vpc` | VPC, 3 Subnet (Public/Private/Data), NAT Gateway, IGW, Route Tables | CIDR: 10.0.0.0/16 |
-| `ecr` | ECR Repository | 镜像保留策略: 最近 10 个 |
-| `ecs` | ECS Cluster, 11 个 Task Definition + Service, Auto Scaling | 见 3.2 资源表 |
-| `redis` | ElastiCache Redis (cache.t3.small, 单节点) | Port 6379, maxmemory-policy: allkeys-lru |
-| `rds` | RDS PostgreSQL 16 (db.t3.small) + TimescaleDB 扩展 | Port 5432, 20GB GP3 |
-| `secrets` | Secrets Manager × 4 (API Key, Private Key, DB Password, Telegram Token) | 自动轮转: 关闭 |
-| `monitoring` | CloudWatch Log Groups (每服务一个), Alarms (CPU/Memory/Error), SNS Topic | 告警 → Email/Webhook |
-| `iam` | ECS Task Execution Role (ECR + Secrets + CW), Task Role (S3 可选) | 最小权限原则 |
-
----
-
-## 附录 C: 配置文件模板
-
-### asset_pool_config.yaml
-
-```yaml
-pools:
-  default:
-    top_k: 100
-    metric: usdt_volume_30d
-    update_interval: 24h
-
-  t50_monthly:
-    top_k: 50
-    metric: dollar_volume_monthly
-    lag: 1                        # 使用上月数据
-    update_interval: monthly
-    min_history_days: 60          # 历史不足 60 天排除
-```
-
-### bar_source_config.yaml
-
-```yaml
-bar_type: dollar_bar             # dollar_bar | time_bar
-
-dollar_bar:
-  initial_threshold: 50000       # 初始 dollar volume 阈值 (USD)
-  ema_window: 50                 # auto_K50_ema 自适应窗口
-  min_ticks_per_bar: 10          # 最少 tick 数
-
-time_bar:
-  interval: 5m                   # 时间窗口 (1m / 5m / 15m / 1h)
-
-tick_features:
-  rolling_window: 50             # rolling bar 窗口大小
-  enabled: true                  # 是否计算 tick 微观特征
-
-consumer_group: bar_source_consumers
-stream_key: market:trades
-batch_size: 100                  # 每次从 Stream 读取的最大消息数
-block_ms: 1000                   # 阻塞等待时间 (毫秒)
-```
-
-### strategy_config.yaml
-
-```yaml
-mode: single                    # single | ensemble
-active_strategy: rev_1d
-
-# 单策略参数
-parameters:
-  long_n: 30
-  short_n: 30
-  rebalance_days: 1             # R1 = 每日换仓
-
-# 多策略集成 (mode: ensemble 时生效)
-# mode: ensemble
-# ensemble_method: weighted_average
-# strategies:
-#   - name: rev_x_inv_vpin
-#     weight: 0.3
-#     pool: default
-#     rebalance_days: 1
-#     parameters:
-#       long_n: 10
-#       short_n: 10
-#   - name: rev_1d
-#     weight: 0.3
-#     pool: default
-#     rebalance_days: 1
-#     parameters:
-#       long_n: 30
-#       short_n: 30
-#   - name: ofi_14d
-#     weight: 0.4
-#     pool: t50_monthly
-#     rebalance_days: 14
-#     parameters:
-#       long_n: 15
-#       short_n: 15
-#       min_candidates: 30
-#       min_history_days: 60
-
-# 调度
-cron_enabled: true
-cron_schedule: "59 23 * * *"    # 每日 23:59 UTC (same_day 模式)
-```
-### risk.yaml
-
-**V1 Sprint 1–3（当前实现）**：
-
-```yaml
-enabled: true
-always_approve: false
-reject_symbols: []
-```
-
-RiskService 当前只做 `reject_symbols` 过滤 + 硬编码 sizing（`PLACEHOLDER_NOTIONAL_USDT = 100.0`）。完整的 sizing 配置和组合级风控规则将在 Sprint 4 同步引入：
-
-```yaml
-# Sprint 4 规划（尚未实装）
-sizing_scheme: equal_notional           # equal_notional | signal_proportional | vol_target
-equity_source: total_equity             # total_equity | available_balance
-target_gross_exposure: 1.0
-max_position_notional_usdt: null        # 单仓 USDT 上限；null = 不限制
-
-max_drawdown_halt: 0.30
-min_balance_reserve: 100.0
-max_daily_turnover: 3.0
-blacklist: []
-dry_run: true
-```
-
-### execution_config.yaml
-
-```yaml
-# 执行质量网关 (ExecutionService) 配置
-# 对每笔 delta order 做 滑点 / 深度 / 预算 三项检查，全部通过才 emit execution_approved
-
-# 滑点检查
-max_slippage_bps: 10                 # 最大允许滑点 (basis points, 10 bps = 0.1%)
-
-# 深度检查
-min_depth_ratio: 3.0                 # 前 10 档累计量至少是订单量的 N 倍
-depth_levels: 10                     # 深度检查观察的档位数
-
-# 订单簿新鲜度
-orderbook_max_age_ms: 2000           # 超龄的订单簿快照视为不可用
-reject_on_stale_book: true           # 超龄时是否直接拒绝 (false = 退化为滑点估算)
-
-# 预算检查
-single_order_max_usdt: 5000          # 单笔订单金额上限 (USDT)
-portfolio_budget_max_usdt: 50000     # 本次换仓的组合累计金额上限 (USDT)
-
-# 拒绝策略
-rejection_policy: all_or_nothing     # all_or_nothing (推荐，V1) | partial (放行通过的部分)
-
-# Redis 读取
-orderbook_key_pattern: "quant:orderbook:{symbol}"
-```
-
-### monitor_config.yaml
-
-```yaml
-heartbeat_check_interval: 30    # 秒
-heartbeat_timeout: 120          # 秒, 超过则告警
-
-alerts:
-  data_delay_threshold: 300     # 秒, 最新 kline 延迟告警
-  balance_drop_threshold: 0.05  # 5% 余额下降告警
-  position_mismatch_threshold: 0.1  # 目标 vs 实际仓位偏差 10%
-
-webhook:
-  enabled: true
-  url: ""                       # Telegram Bot API URL
-  channel_id: ""                # Telegram Chat ID
-```
-
+| DataService / Account / Risk / Execution | 已实现（单账户、单全局键空间） |
+| Strategy（scheduler + 策略 5） | 已实现 |
+| Keyspace（account-scoped 入口） | **待建**——两栈前必做，否则键冲突 |
+| Strategy（streaming + 策略 6） | **待建**（插件 + 美元 bar + 特征 + 模型 + 状态） |
+| Order | **待建**（管线现止于 `execution_approved`） |
+| Target Portfolio（diff 模块化） | **待建**（差量逻辑当前散在计划稿） |
+| 持久化三表 / Alert / 急停 / API 补全 | **待建** |
+| 通用 bar→feature 流式链 | **延迟**（无真实消费者，§八） |
+
+## 十四、扩展到更多策略
+
+加策略 3 = 加一个（子）账户 + 一条栈：
+
+1. 开一个子账户，建 `.env.acct{X}`（API key + `{account}` 标识）。
+2. 选形态：横截面/低频 → `ScheduledStrategy`；流式/有状态 → `StreamingStrategy`。
+3. 实现该形态的完整 interface，产出 Target Portfolio。
+4. 起该栈的 Strategy/Risk/Execution/Order/Account 实例（同镜像，注入 `{account}`）。
+5. 若 ≥2 个流式策略要共享特征 → 此时才建 §八 的通用 bar→feature 链。
+
+L1/L2 策略 API（列表/详情/状态视图）天然支持 N 策略，无需改契约——加策略 = 加一个 `state_view` 视图类型 + 前端一张卡片。

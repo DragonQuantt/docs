@@ -1,7 +1,11 @@
 # 系统设计方案 — V1 / V2 迭代规划
 
 > 编写时间: 2026-03-03
-> 基于: 00_overview.md 策略研究成果 + 现有代码架构 Review + strategy_3.md (ofi_14d)
+> 基于: 00_overview.md 策略研究成果 + 现有代码架构 Review + ofi_14d 研究稿
+
+!!! warning "更新（2026-06-11）"
+    本文 V0 现状表编写于 2026-03，部分已过时：FuturesOrderService 已拆分为 Strategy → Risk → Execution 服务链，TickerService 已重构为 DataService，频道 `order_approved` 已由 `risk_approved` / `execution_approved` 取代（以 `common/redis/constants.py` 为准）。
+    当前实际进度与下一步实施范围见 **[Phase A 实施计划](../sprint/phase_a_plan.md)**。当前唯一已实现策略：[策略 5 · 月度轮动](strategy_5.md)（monthly_majors_vs_alts，分支 `feat/majors_vs_alts_vol_target`）。2026-06-11 执行策略清零：baseline_rev 与 crypto_pairs_mean_reversion 的实现及文档均已删除；策略 1~4（rev_x_inv_vpin / baseline_rev / ofi_14d / rev_1d）的研究稿文档亦一并删除——以上均可从 git 历史找回。
 
 ---
 
@@ -164,7 +168,7 @@ flowchart TD
 ### V2 各模块概要
 
 > 各服务的详细设计（接口、配置、代码示例等）参见 `docs/architecture.md`。
-> 策略信号公式详见 `docs/overview/strategy_1.md`、`docs/overview/strategy_2.md` 和 `docs/overview/strategy_3.md`。
+> 策略信号公式见研究侧产出（原 docs 策略稿 strategy_1~4 已于 2026-06-11 删除，git 历史可查）。
 > 以下仅列出 V2 阶段的增量变更。
 
 | 模块 | 变更类型 | V2 核心变更 |

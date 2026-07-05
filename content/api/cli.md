@@ -1,356 +1,229 @@
-# CLI 命令参考
+# CLI 命令
 
-Quant Trading 系统命令行接口完整参考。
+入口 `main`（`quant_trading.app.cli:main`）。每条竖直栈的服务用 `--account` 绑定账户与键空间；共享层服务不带 `--account`。
 
-> **版本说明**: 以下为 V0 已实现的命令。V1/V2 迭代中计划新增 `trading strategy`、`trading risk`、`trading monitor`、`trading account` 等子命令，详见 `docs/architecture.md` 第 3.5 节 CI/CD 流程和 `docs/sprint/back_end_sprint.md`。
+!!! note "本页是目标形态"
+    下文按两账户、`--account` 的目标形态书写。当前实测为单账户（仅 `--env`）、已注册 8 个命令——逐命令差异见末尾[实现状态](#status)。事件契约见 [Redis](redis.md)，不在此重复。
 
-## 全局选项
+## 通用选项
+
+所有 `run` 子命令共享：
+
+| 选项 | 说明 |
+|------|------|
+| `-E, --env` | 环境 `dev` / `prod`，加载 `.env.{env}`。默认 `dev` |
+| `-A, --account` | 栈/账户标识，每栈服务必填。决定键空间 `quant:{account}:*` 与 `.env.acct{account}` |
 
 ```bash
-# 查看所有命令
-main --help
-
-# 查看特定命令帮助
-main <command> --help
+main --help            # 全部命令
+main <command> --help  # 单命令帮助
 ```
 
-## 配置管理
+## 数据库与配置
 
-### create-templates
+### `main db init`
 
-生成所有服务的 YAML 配置文件模板。
+按 ORM 创建缺失的数据库表，幂等。首次部署执行一次。
 
 **用法**
 
 ```bash
-main create-templates
+main db init [-E env]
 ```
 
-**说明**
+### `main configs`
 
-在 `configs/` 目录下创建以下配置文件：
-- `server_config.yaml` - 服务器配置
-- `db_config.yaml` - 数据库配置
-- `asset_pool_config.yaml` - 资产池配置
-- `aggregator_config.yaml` - 聚合器配置
-- `feature_config.yaml` - 特征计算配置
-- `order_config.yaml` - 订单服务配置
+管理 YAML 配置。
 
-**示例**
+| 子命令 | 作用 |
+|--------|------|
+| `configs list` | 列出所有配置类对应的 YAML 路径与状态 |
+| `configs generate [-f]` | 按默认值生成模板，`-f` 覆盖已存在 |
+| `configs load` | 加载并校验所有 YAML |
 
-```bash
-# 生成配置模板
-main create-templates
-```
+## 共享层服务
 
-## 业务服务器
+单实例，不带 `--account`。
 
-### run-server
+### `main data-service run`
 
-启动 WebSocket 市场数据服务器（API 网关）。
+采集公共行情写入 Redis。
 
 **用法**
 
 ```bash
-main run-server [OPTIONS]
+main data-service run [选项]
 ```
 
 **选项**
 
-- `-H, --host TEXT` - 绑定主机地址（默认：0.0.0.0）
-- `-p, --port INTEGER` - 绑定端口号（默认：8000）
-- `--log-level TEXT` - 日志级别（默认：info）
+| 选项 | 说明 |
+|------|------|
+| `-w, --watch-mode` | `trades_raw` / `orderbook` / `ohlcv` / `tickers`。默认 `trades` |
+| `-e, --exchange` | 交易所 ID。默认 `binanceusdm` |
+| `--orderbook-limit` | 订单簿档位，`orderbook` 模式。默认 20 |
+| `--maxlen` | Stream 最大条数。默认 500000 |
 
 **示例**
 
 ```bash
-# 启动服务器
-main run-server
-
-# 指定端口
-main run-server --port 9000
-
-# 调试模式
-main run-server --log-level debug
+main data-service run --watch-mode trades_raw   # 逐笔流，供策略 6
+main data-service run --watch-mode orderbook    # 盘口快照，供两栈执行校验
 ```
 
-**访问地址**
+### `main api-gateway run`
 
-- WebSocket:
-  - `ws://<host>:<port>/ws/positions`
-  - `ws://<host>:<port>/ws/portfolio`
-  - `ws://<host>:<port>/ws/alerts`
-  - `ws://<host>:<port>/ws/services`
-- 健康检查: `http://<host>:<port>/api/v1/health`
-
-## 测试客户端
-
-### ticker-test-client
-
-WebSocket 测试客户端，用于测试市场数据流。
+对外 HTTP / WebSocket 网关。
 
 **用法**
 
 ```bash
-main ticker-test-client [OPTIONS]
+main api-gateway run [-H host] [-P port]
 ```
 
 **选项**
 
-- `-u, --uri TEXT` - WebSocket 服务器 URI（默认：ws://localhost:8000/ws/services）
-- `-s, --symbol TEXT` - 交易对符号（默认：BTC/USDT）
-- `-e, --exchange TEXT` - 交易所 ID（默认：binance）
-- `-d, --duration INTEGER` - 运行持续时间（秒，默认：30）
-- `-t, --test` - 使用模拟数据模式
+| 选项 | 说明 |
+|------|------|
+| `-H, --host` | 监听地址。默认 `0.0.0.0` |
+| `-P, --port` | 监听端口。默认 8000 |
 
-**示例**
+### `main alert-service run`
 
-```bash
-# 默认测试
-main ticker-test-client
-
-# 模拟数据模式
-main ticker-test-client --test
-
-# 连接真实交易所
-main ticker-test-client --symbol ETH/USDT --duration 60
-
-# 测试多个交易对
-main ticker-test-client --symbol BNB/USDT --exchange binance
-```
-
-## 业务客户端
-
-### ticker-db-client
-
-数据持久化服务，将 Ticker 数据存储到 TimescaleDB。
+聚合各栈拒绝 / 失败事件与心跳超时，推送 Telegram。
 
 **用法**
 
 ```bash
-main ticker-db-client [OPTIONS]
+main alert-service run
 ```
 
-**选项**
+### `main asset-pool-service run`
 
-- `-s, --symbol TEXT` - 交易对符号（默认：BTC/USDT）
-- `-e, --exchange TEXT` - 交易所 ID（默认：binance）
-- `-w, --ws-uri TEXT` - WebSocket 服务器 URI（默认：ws://localhost:8000/ws/positions）
-- `-d, --duration INTEGER` - 运行持续时间（秒，默认：无限）
-- `-t, --test` - 从服务器接收模拟数据
-- `-r, --retention INTEGER` - 数据保留策略（天数，默认：30）
-- `-E, --env TEXT` - 环境配置前缀（默认：dev）
-
-**说明**
-
-数据库连接信息从 `configs/.env.{env}` 文件读取（例如 `.env.dev` 或 `.env.prod`）。
-
-**示例**
-
-```bash
-# 持久化到开发环境数据库
-main ticker-db-client --symbol BTC/USDT --exchange binance
-
-# 生产环境，保留 90 天数据
-main ticker-db-client --env prod --retention 90
-
-# 测试模式（有限时间）
-main ticker-db-client --test --duration 60
-```
-
-### asset-pool-service
-
-资产池服务，根据成交量计算并发布 Top K 资产列表。
+写资产池 SET。两策略自发现宇宙，通常不需要。
 
 **用法**
 
 ```bash
-main asset-pool-service [OPTIONS]
+main asset-pool-service run
 ```
 
-**选项**
+## 每栈服务
 
-- `-e, --exchange TEXT` - 交易所 ID（从配置读取）
-- `-k, --top-k INTEGER` - Top K 资产数量（从配置读取）
-- `-d, --days INTEGER` - 回溯天数（从配置读取）
-- `-q, --quote TEXT` - 计价货币过滤器（从配置读取）
-- `-i, --interval FLOAT` - 更新间隔（小时，从配置读取）
-- `--once` - 仅运行一次后退出
-- `-E, --env TEXT` - 环境配置（默认：dev）
+每账户一份，`--account` 必填。一条栈含五个服务：
 
-**说明**
+| 命令 | 角色 |
+|------|------|
+| `strategy-service run` | 产出目标组合 |
+| `risk-service run` | USDT sizing |
+| `execution-service run` | 盘口校验 |
+| `order-service run` | 差量下单 |
+| `account-service run` | 账户同步 |
 
-配置从 `configs/asset_pool_config.yaml` 加载，命令行选项会覆盖配置文件。
+### `main strategy-service run`
 
-**示例**
-
-```bash
-# 使用配置文件启动
-main asset-pool-service
-
-# 覆盖 Top K 参数
-main asset-pool-service --top-k 50
-
-# 单次运行
-main asset-pool-service --once
-
-# 自定义更新间隔
-main asset-pool-service --interval 12
-```
-
-### aggregator-service
-
-Tick 聚合服务，将 Tick 数据聚合为 K 线（OHLCV）。
+运行该栈的策略，产出目标组合。按策略 `execution_mode` 自动选 scheduler 或 event_driven。
 
 **用法**
 
 ```bash
-main aggregator-service [OPTIONS]
+main strategy-service run -A <account>
 ```
-
-**选项**
-
-- `-e, --exchange TEXT` - 交易所 ID（从配置读取）
-- `-t, --timeframe TEXT` - 聚合时间框架（从配置读取）
-- `-r, --rebalance-klines INTEGER` - N 根 K 线后触发再平衡（从配置读取）
-- `-n, --retention INTEGER` - 每个品种最多保留 K 线数量（从配置读取）
-- `--test` - 使用模拟 Tick 数据
-- `-E, --env TEXT` - 环境配置（默认：dev）
-
-**说明**
-
-- 配置从 `configs/aggregator_config.yaml` 加载
-- 支持的时间框架：1m, 5m, 15m, 30m, 1h, 4h, 1d
-- K 线数据实时存储到 Redis
-- 累积 N 根 K 线后发布 `kline_aggregated` 事件触发特征计算
 
 **示例**
 
 ```bash
-# 使用配置启动
-main aggregator-service
-
-# 模拟数据模式
-main aggregator-service --test
-
-# 自定义再平衡间隔
-main aggregator-service --rebalance-klines 10
-
-# 更改时间框架
-main aggregator-service --timeframe 5m
+main strategy-service run -A acctA   # 策略 6，event_driven
+main strategy-service run -A acctB   # 策略 5，scheduler
 ```
 
-### feature-service
+### `main risk-service run`
 
-特征计算服务，基于 K 线数据计算技术指标和特征。
+按账户权益给目标组合做 USDT sizing。参数见 `yamls/risk.<account>.yaml`。
 
 **用法**
 
 ```bash
-main feature-service [OPTIONS]
+main risk-service run -A <account>
 ```
 
-**选项**
+### `main execution-service run`
 
-- `-p, --periods TEXT` - 逗号分隔的回溯周期列表（从配置读取）
-- `-E, --env TEXT` - 环境配置（默认：dev）
-
-**说明**
-
-- 配置从 `configs/feature_config.yaml` 加载
-- 订阅 Redis `kline_aggregated` 事件
-- 计算完成后发布 `feature_calculated` 事件
-
-**示例**
-
-```bash
-# 使用配置启动
-main feature-service
-
-# 自定义回溯周期
-main feature-service --periods 5,10,20,50
-```
-
-### order-service
-
-订单执行服务，根据特征信号执行交易策略。
+读盘口快照做逐腿深度 / 新鲜度校验，名义金额折算合约数。
 
 **用法**
 
 ```bash
-main order-service [OPTIONS]
+main execution-service run -A <account>
 ```
 
-**选项**
+### `main order-service run`
 
-- `-b, --balance FLOAT` - 初始现金余额（从配置读取）
-- `-m, --max-positions INTEGER` - 最大持仓数量（从配置读取）
-- `-t, --threshold FLOAT` - 动量阈值（从配置读取）
-- `-E, --env TEXT` - 环境配置（默认：dev）
-
-**说明**
-
-- 配置从 `configs/order_config.yaml` 加载
-- 订阅 Redis `feature_calculated` 事件
-- 执行交易后发布 `order_update` 和 `position_update` 事件
-
-**示例**
-
-```bash
-# 使用配置启动
-main order-service
-
-# 自定义参数
-main order-service --balance 50000 --max-positions 20 --threshold 0.02
-```
-
-### run-all-services
-
-一次性启动所有业务服务。
+对本账户净持仓做差量下单（先平后开），幂等，默认 `dry_run`。
 
 **用法**
 
 ```bash
-main run-all-services [OPTIONS]
+main order-service run -A <account>
+```
+
+### `main account-service run`
+
+轮询本子账户私有数据，写组合快照。
+
+**用法**
+
+```bash
+main account-service run -A <account> [-p poll]
 ```
 
 **选项**
 
-- `--test` - 使用模拟 Tick 数据
-- `-E, --env TEXT` - 环境配置（默认：dev）
+| 选项 | 说明 |
+|------|------|
+| `-p, --poll` | 轮询间隔，秒。默认 30 |
 
-**说明**
+## 训练
 
-启动以下所有服务：
-- Asset Pool Service（资产池服务）
-- Aggregator Service（聚合器服务）
-- Feature Service（特征服务）
-- Order Service（订单服务）
+### `main strategy6-train`
 
-所有服务从各自的 YAML 配置文件加载参数。
+策略 6 的季度离线重训，产出模型工件供插件热加载。非常驻进程。
 
-**示例**
+**用法**
 
 ```bash
-# 启动所有服务
-main run-all-services
-
-# 测试模式
-main run-all-services --test
-
-# 生产环境
-main run-all-services --env prod
+main strategy6-train
 ```
 
-## 环境指定
+## 起栈示例
 
-所有服务都支持 `--env` / `-E` 选项来指定环境：
+```bash
+main db init
 
-- `dev`（默认）：使用 `configs/.env.dev`
-- `prod`：使用 `configs/.env.production`
+# 共享层
+main data-service run --watch-mode trades_raw &
+main data-service run --watch-mode orderbook &
+main api-gateway run &
 
-环境文件应包含：
-- `REDIS_HOST` - Redis 主机地址
-- `REDIS_PORT` - Redis 端口
-- `REDIS_DB` - Redis 数据库编号
-- `DB_*` - TimescaleDB 连接参数（仅 ticker-db-client 需要）
+# 栈 A（策略 6）+ 栈 B（策略 5）
+for s in strategy risk execution order account; do
+  main $s-service run -A acctA &
+  main $s-service run -A acctB &
+done
+```
+
+## 环境与密钥
+
+每栈一份 `.env.acct{X}`，含 `ACCOUNT_ID`（= `{account}`）与该子账户的 `EXCHANGE_API_KEY` / `EXCHANGE_SECRET` / `EXCHANGE_PRIVATE_KEY_PATH`；共享 `REDIS_*` / `DB_*`。密钥勿提交仓库，生产走 Secrets Manager。详见[配置说明](../getting-started/configuration.md)。
+
+## 实现状态 {#status}
+
+| 命令 | 状态 |
+|------|------|
+| `db init`、`configs *` | 已实现 |
+| `data-service run`、`asset-pool-service run` | 已实现 |
+| `strategy-service run`（scheduler）、`risk-service run`、`account-service run` | 已实现 |
+| `execution-service run` | 服务已实现，CLI 命令未注册（`main` 暂不可调） |
+| `--account` 多账户与键空间 | 规划 |
+| `strategy-service run`（event_driven）、`order-service run` | 规划 |
+| `api-gateway run`、`alert-service run`、`strategy6-train` | 规划 |
